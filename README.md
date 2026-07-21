@@ -7,6 +7,50 @@ For competition updates, join [discord.gg/gpumode](https://discord.gg/gpumode) a
 
 We are grateful to [Modal](https://modal.com/) for supporting the GPU evaluation infrastructure and to [Northflank](https://northflank.com/) for supporting the competition service and leaderboard. Thank you both for helping make this research competition possible.
 
+## FORK CHANGES START
+
+```bash
+git clone https://github.com/tilde-research/one-layer-deeper.git
+cd one-layer-deeper
+uv venv .venv
+source .venv/bin/activate
+uv sync
+python -m unittest discover -s tests
+./scripts/generate_datasets.sh
+CUDA_VISIBLE_DEVICES=0 python -m benchmark.runner --manifest benchmark/manifests/h100_easy_e1.json --submission-file submissions/baseline_adamw/submission.py
+```
+
+### Example output:
+```
+(.venv) [/one-layer-deeper-competition-fork (working_branch)]$ CUDA_VISIBLE_DEVICES=0 python -m benchmark.runner \
+  --manifest benchmark/manifests/h100_easy_e1.json \
+  --submission-file submissions/baseline_adamw/submission.py
+{
+  "manifest": "squaring-mod-easy-e1",
+  "model_spec": {
+    "vocab_size": 17,
+    "max_seq_len": 10,
+    "maximum_model_state_elements": 500000000
+  },
+  "training_batch_size": 512,
+  "evaluation_batch_size": 512,
+  "max_training_steps": 1000000,
+  "total_training_time_seconds": 60.0,
+  "training_time_seconds_per_seed": 60.0,
+  "evaluation_time_seconds_per_seed": 30.0,
+  "seeds": [
+    74
+  ]
+}
+step=1 loss=83.809090 accuracy=0.005859 elapsed=2.8s budget=60.0s
+step=100 loss=1.814864 accuracy=0.041016 elapsed=24.0s budget=60.0s
+step=200 loss=1.710341 accuracy=0.066406 elapsed=45.0s budget=60.0s
+seed=74 split=test loss=2.242819 exact_accuracy=0.013333
+seed=74 split=ood loss=5.122462 exact_accuracy=0.000000
+RESULT_JSON={"manifest": "squaring-mod-easy-e1", "score": {"mean_exact_accuracy": 0.006666666828095913, "mean_loss": 3.6826404333114624, "num_measurements": 2, "primary_metric": "mean_exact_accuracy"}, "seeds": [{"completed_training_steps": 272, "evaluation": {"ood": {"exact_accuracy": 0.0, "loss": 5.122461795806885}, "test": {"exact_accuracy": 0.013333333656191826, "loss": 2.24281907081604}}, "evaluation_batch_size": 512, "evaluation_budget_seconds": 30.0, "evaluation_seconds": 0.3637570870050695, "final_train_loss": 1.6074628829956055, "max_training_steps": 1000000, "model_state_elements": 201600, "optimizer_state_elements_after_first_step": 403213, "seed": 74, "training_batch_size": 512, "training_seconds": 60.10418328101514}]}
+```
+
+## FORK CHANGES END
 
 ## Install
 
