@@ -5,6 +5,10 @@ from __future__ import annotations
 from html import escape
 import json
 
+from .competition import (
+    SUBMISSION_DEADLINE_LABEL,
+    SUBMISSIONS_CLOSED_MESSAGE,
+)
 from .tiers import TIERS, TIER_BY_ID
 
 
@@ -25,6 +29,9 @@ def _layout(title: str, content: str, *, refresh: bool = False) -> str:
     <a class="brand" href="/"><span class="brand-mark">1L↓</span> One Layer Deeper</a>
     <nav><a href="/">Leaderboard</a><a href="/problem">Problem</a><a href="/register">Sign in</a><a class="button small" href="/submit">Submit</a></nav>
   </header>
+  <aside class="shell competition-deadline" aria-label="Competition submission deadline">
+    <strong>Submission deadline:</strong> {escape(SUBMISSION_DEADLINE_LABEL)}.
+  </aside>
   <main class="shell">{content}</main>
   <footer class="shell">
     <strong>Core Automation × Tilde Research</strong><br>
@@ -154,7 +161,10 @@ def submit_page(
     *,
     selected_tier: str = "easy",
     selected_dataset: str | None = None,
+    submissions_are_closed: bool = False,
 ) -> str:
+    if submissions_are_closed and error is None:
+        error = SUBMISSIONS_CLOSED_MESSAGE
     error_html = f'<div class="error">{escape(error)}</div>' if error else ""
     tier = TIER_BY_ID.get(selected_tier, TIER_BY_ID["easy"])
     valid_dataset_ids = {dataset.id for dataset in tier.datasets}
@@ -184,7 +194,20 @@ def submit_page(
         }
     )
     dataset_hidden = " hidden" if tier.id == "hard" else ""
-    dataset_disabled = " disabled" if tier.id == "hard" else ""
+    control_disabled = " disabled" if submissions_are_closed else ""
+    dataset_disabled = (
+        " disabled" if tier.id == "hard" or submissions_are_closed else ""
+    )
+    upload_card_class = (
+        "upload-card submissions-closed"
+        if submissions_are_closed
+        else "upload-card"
+    )
+    submit_label = (
+        "Submissions closed"
+        if submissions_are_closed
+        else "Queue H100 evaluation"
+    )
     content = f"""
     <section class="submit-grid">
       <div><p class="eyebrow">Single-file contract</p><h1>Ship the idea,<br><em>not the pipeline.</em></h1>
@@ -207,15 +230,15 @@ def submit_page(
           <span>06</span><p><strong>The metric recorder for a Hard run must not be exploited.</strong> Any attempt to exploit it will result in an immediate ban.</p>
         </div>
       </section></div>
-      <form class="upload-card" action="/submit" method="post" enctype="multipart/form-data">
+      <form class="{upload_card_class}" action="/submit" method="post" enctype="multipart/form-data">
         <div><span class="file-kicker">PY</span><h2>Upload submission.py</h2><p>One self-contained Python file, up to 256 KiB.</p></div>
         {error_html}
-        <label class="text-field"><span>API key</span><input name="api_key" type="password" autocomplete="off" placeholder="old_…" required></label>
-        <label class="text-field"><span>Compute tier</span><select id="tier-select" name="tier" required>{tier_options}</select></label>
+        <label class="text-field"><span>API key</span><input name="api_key" type="password" autocomplete="off" placeholder="old_…" required{control_disabled}></label>
+        <label class="text-field"><span>Compute tier</span><select id="tier-select" name="tier" required{control_disabled}>{tier_options}</select></label>
         <label id="dataset-field" class="text-field"{dataset_hidden}><span>Dataset</span><select id="dataset-select" name="dataset"{dataset_disabled}>{dataset_options}</select></label>
         <div class="tier-note"><strong>Daily limits use UTC:</strong> Easy 60 · Medium 6 · Hard 1. Accepted failed runs count; rejected uploads do not.</div>
-        <label class="file-field"><span>Choose submission.py</span><input name="file" type="file" accept=".py,text/x-python" required></label>
-        <button class="button" type="submit">Queue H100 evaluation</button>
+        <label class="file-field"><span>Choose submission.py</span><input name="file" type="file" accept=".py,text/x-python" required{control_disabled}></label>
+        <button class="button" type="submit"{control_disabled}>{submit_label}</button>
         <p class="form-note">No key yet? <a href="/register">Sign in with GitHub</a>. CLI users run <code>one-layer login</code> once; submissions must pass <code>--tier</code> and, for Easy or Medium, <code>--dataset</code>. Only the best successful Hard score per participant is ranked.</p>
       </form>
       <script>

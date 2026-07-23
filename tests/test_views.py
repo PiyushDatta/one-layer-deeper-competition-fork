@@ -131,6 +131,16 @@ class FooterAcknowledgementTests(unittest.TestCase):
         self.assertIn("#one-layer-deeper", page)
 
 
+class CompetitionDeadlineTests(unittest.TestCase):
+    def test_shared_layout_shows_submission_deadline(self) -> None:
+        page = leaderboard_page([])
+        self.assertIn(
+            "<strong>Submission deadline:</strong> August 31 at 10:00 PM PT.",
+            page,
+        )
+        self.assertIn('aria-label="Competition submission deadline"', page)
+
+
 class CompetitionRulesLinkTests(unittest.TestCase):
     def test_leaderboard_links_to_repository(self) -> None:
         page = leaderboard_page([])
