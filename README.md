@@ -3,6 +3,8 @@ An architecture-and-optimizer competition from **Core Automation × Tilde Resear
 
 Build the best function-composition model under a fixed persistent-state ceiling and H100 training-time budget. Participants control architecture, depth, optimizer, learning-rate schedule, and training loss. The evaluator controls data, the outer loop, and final evaluation.
 
+> **Submission deadline:** August 31 at 10:00 PM PT. The service will not accept submissions after this time.
+
 For competition updates, join [discord.gg/gpumode](https://discord.gg/gpumode) and follow the `#one-layer-deeper` channel.
 
 We are grateful to [Modal](https://modal.com/) for supporting the GPU evaluation infrastructure and to [Northflank](https://northflank.com/) for supporting the competition service and leaderboard. Thank you both for helping make this research competition possible.
