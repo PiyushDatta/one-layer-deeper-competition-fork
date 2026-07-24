@@ -225,9 +225,10 @@ def submit_page(
           <span>01</span><p><strong>Maximum 500 million trainable parameters.</strong></p>
           <span>02</span><p><strong>No hard-coded weights.</strong> Trainable weights must use a random initialization and be updated during training. For example, <code>torch.load</code> is not allowed.</p>
           <span>03</span><p><strong>No hard-coded algorithm in the forward pass.</strong> Outputs must be produced by the learned model.</p>
-          <span>04</span><p><strong>Everything stays on the GPU.</strong> Model state and computation must remain on the GPU throughout training and evaluation; CPU offloading is not allowed.</p>
-          <span>05</span><p><strong>Repeated rule-breaking will get you banned.</strong> We still encourage creativity: discussing possible loopholes on Discord or testing one in a submission won't get you banned.</p>
-          <span>06</span><p><strong>The metric recorder for a Hard run must not be exploited.</strong> Any attempt to exploit it will result in an immediate ban.</p>
+          <span>04</span><p><strong>End-to-end learning only.</strong> Final logits must be produced entirely by the submitted model from its inputs and learned PyTorch state, with all input-dependent computation inside the autograd graph and an unbroken gradient path from the loss to the parameters responsible for the prediction.</p>
+          <span>05</span><p><strong>Everything stays on the GPU.</strong> Model state and computation must remain on the GPU throughout training and evaluation; CPU offloading is not allowed.</p>
+          <span>06</span><p><strong>Repeated rule-breaking will get you banned.</strong> We still encourage creativity: discussing possible loopholes on Discord or testing one in a submission won't get you banned.</p>
+          <span>07</span><p><strong>The metric recorder for a Hard run must not be exploited.</strong> Any attempt to exploit it will result in an immediate ban.</p>
         </div>
       </section></div>
       <form class="{upload_card_class}" action="/submit" method="post" enctype="multipart/form-data">

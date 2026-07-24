@@ -61,6 +61,15 @@ class SubmissionRulesPageTests(unittest.TestCase):
         self.assertIn("use a random initialization", page)
         self.assertIn("<code>torch.load</code> is not allowed", page)
         self.assertIn("No hard-coded algorithm in the forward pass", page)
+        self.assertIn("End-to-end learning only", page)
+        self.assertIn(
+            "with all input-dependent computation inside the autograd graph",
+            page,
+        )
+        self.assertIn(
+            "an unbroken gradient path from the loss to the parameters responsible for the prediction",
+            page,
+        )
         self.assertIn("Everything stays on the GPU", page)
         self.assertIn("CPU offloading is not allowed", page)
         self.assertIn("Repeated rule-breaking will get you banned", page)
@@ -73,15 +82,15 @@ class SubmissionRulesPageTests(unittest.TestCase):
             page.index('id="submission-rules-heading">Rules</h2>'),
         )
         self.assertIn(
-            "<span>04</span><p><strong>Everything stays on the GPU.",
+            "<span>05</span><p><strong>Everything stays on the GPU.",
             page,
         )
         self.assertIn(
-            "<span>05</span><p><strong>Repeated rule-breaking will get you banned.",
+            "<span>06</span><p><strong>Repeated rule-breaking will get you banned.",
             page,
         )
         self.assertIn(
-            "<span>06</span><p><strong>The metric recorder for a Hard run must not be exploited.",
+            "<span>07</span><p><strong>The metric recorder for a Hard run must not be exploited.",
             page,
         )
 
