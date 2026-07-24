@@ -43,6 +43,22 @@ def _score(row: dict) -> str:
     return "—" if value is None else f"{100 * float(value):.2f}%"
 
 
+
+def _max_t(row: dict, key: str) -> str:
+    profile = (row.get("result") or {}).get("depth_profile") or {}
+    if key == "ood_n_max_certified_time_steps":
+        available = row.get("ood_n_profile_available")
+        if available is None:
+            available = profile.get("ood_n_profile_available")
+        if available is False:
+            return "N/A"
+    value = row.get(key)
+    if value is None:
+        value = profile.get(key)
+    if value is None:
+        return "<1" if row.get("status") == "succeeded" else "—"
+    return str(int(value))
+
 def _load_saved_api_key(server: str) -> str | None:
     try:
         config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -87,6 +103,8 @@ def _print_status(row: dict) -> None:
     print(f"file        {row['filename']}")
     print(f"status      {row['status']}")
     print(f"score       {_score(row)}")
+    print(f"max T       {_max_t(row, 'max_certified_time_steps')}")
+    print(f"OOD N max T {_max_t(row, 'ood_n_max_certified_time_steps')}")
     print(f"tier        {row.get('tier') or 'legacy'}")
     print(f"dataset     {row.get('dataset_label') or row['manifest_name']}")
     print(f"suite       {row['manifest_name']}")
@@ -338,16 +356,17 @@ def command_leaderboard(args) -> int:
     if not rows:
         print("No submissions yet.")
         return 0
-    print("Hard leaderboard · best successful score per participant")
-    print(f"{'#':>3}  {'score':>8}  participant / file")
-    print(f"{'—' * 3}  {'—' * 8}  {'—' * 32}")
+    print("Hard leaderboard · ranked by Max T, then OOD N Max T")
+    print(f"{'#':>3}  {'max T':>5}  {'OOD N max T':>11}  participant / file")
+    print(f"{'—' * 3}  {'—' * 5}  {'—' * 11}  {'—' * 32}")
     for rank, row in enumerate(rows, start=1):
         print(
-            f"{rank:>3}  {_score(row):>8}  "
+            f"{rank:>3}  "
+            f"{_max_t(row, 'max_certified_time_steps'):>5}  "
+            f"{_max_t(row, 'ood_n_max_certified_time_steps'):>11}  "
             f"{row['submitter']} / {row['filename']}"
         )
     return 0
-
 
 def _add_connection_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(

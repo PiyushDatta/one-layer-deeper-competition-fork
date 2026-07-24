@@ -20,6 +20,10 @@ python -m data.squaring_mod \
   --fixed_p 17 --fixed_q 19 \
   --time_steps '[1,2,3]' --ood_time_steps '[6]' \
   --examples_per_setting 250 --ood_examples_per_setting 100 \
+  --depth_evaluation_time_steps '[1,2,4,8,16,32,64]' \
+  --depth_evaluation_exhaustive_x true \
+  --ood_n_depth_evaluation_modulus_bits '[10,11]' \
+  --ood_n_depth_evaluation_examples_per_setting 256 \
   --train_fraction 0.8 --test_fraction 0.2 \
   --split_group prompt --seed 45 --separate_input_output true
 
@@ -29,6 +33,10 @@ python -m data.squaring_mod \
   --fixed_p 29 --fixed_q 31 \
   --time_steps '[1,2,4]' --ood_time_steps '[7]' \
   --examples_per_setting 800 --ood_examples_per_setting 300 \
+  --depth_evaluation_time_steps '[1,2,4,8,16,32,64]' \
+  --depth_evaluation_exhaustive_x true \
+  --ood_n_depth_evaluation_modulus_bits '[11,12]' \
+  --ood_n_depth_evaluation_examples_per_setting 256 \
   --train_fraction 0.8 --test_fraction 0.2 \
   --split_group prompt --seed 45 --separate_input_output true
 
@@ -38,6 +46,10 @@ python -m data.squaring_mod \
   --modulus_bits '[10,11]' --fixed_time_steps 2 \
   --ood_time_steps '[4]' \
   --examples_per_setting 2000 --ood_examples_per_setting 400 \
+  --depth_evaluation_time_steps '[1,2,4,8,16,32,64]' \
+  --depth_evaluation_examples_per_setting 256 \
+  --ood_n_depth_evaluation_modulus_bits '[12,13]' \
+  --ood_n_depth_evaluation_examples_per_setting 256 \
   --train_fraction 0.8 --test_fraction 0.2 \
   --split_group prompt --seed 45 --separate_input_output true
 
@@ -47,6 +59,10 @@ python -m data.squaring_mod \
   --modulus_bits '[11,12]' --fixed_time_steps 2 \
   --ood_time_steps '[4]' \
   --examples_per_setting 4000 --ood_examples_per_setting 600 \
+  --depth_evaluation_time_steps '[1,2,4,8,16,32,64]' \
+  --depth_evaluation_examples_per_setting 256 \
+  --ood_n_depth_evaluation_modulus_bits '[13,14]' \
+  --ood_n_depth_evaluation_examples_per_setting 256 \
   --train_fraction 0.8 --test_fraction 0.2 \
   --split_group prompt --seed 45 --separate_input_output true
 
@@ -56,6 +72,10 @@ python -m data.squaring_mod \
   --modulus_bits '[10,11]' \
   --time_steps '[1,2,3]' --ood_time_steps '[6]' \
   --examples_per_setting 1000 --ood_examples_per_setting 300 \
+  --depth_evaluation_time_steps '[1,2,4,8,16,32,64]' \
+  --depth_evaluation_examples_per_setting 256 \
+  --ood_n_depth_evaluation_modulus_bits '[12,13]' \
+  --ood_n_depth_evaluation_examples_per_setting 256 \
   --train_fraction 0.8 --test_fraction 0.2 \
   --split_group prompt --seed 45 --separate_input_output true
 
@@ -69,6 +89,10 @@ python -m data.squaring_mod \
   --fixed_p 101 --fixed_q 103 \
   --time_steps '[4,8,16]' --ood_time_steps '[32]' \
   --examples_per_setting 10000 --ood_examples_per_setting 3000 \
+  --depth_evaluation_time_steps '[1,2,4,8,16,32,64]' \
+  --depth_evaluation_examples_per_setting 192 \
+  --ood_n_depth_evaluation_modulus_bits '[15,16]' \
+  --ood_n_depth_evaluation_examples_per_setting 256 \
   --train_fraction 0.9 --test_fraction 0.1 \
   --split_group prompt --seed 45 --separate_input_output true
 
@@ -78,6 +102,10 @@ python -m data.squaring_mod \
   --fixed_p 193 --fixed_q 197 \
   --time_steps '[4,8,16]' --ood_time_steps '[32]' \
   --examples_per_setting 30000 --ood_examples_per_setting 5000 \
+  --depth_evaluation_time_steps '[1,2,4,8,16,32,64]' \
+  --depth_evaluation_examples_per_setting 768 \
+  --ood_n_depth_evaluation_modulus_bits '[17,18]' \
+  --ood_n_depth_evaluation_examples_per_setting 256 \
   --train_fraction 0.9 --test_fraction 0.1 \
   --split_group prompt --seed 45 --separate_input_output true
 
@@ -87,6 +115,10 @@ python -m data.squaring_mod \
   --modulus_bits '[11,13,15]' --fixed_time_steps 2 \
   --ood_time_steps '[4]' \
   --examples_per_setting 8000 --ood_examples_per_setting 1000 \
+  --depth_evaluation_time_steps '[1,2,4,8,16,32,64]' \
+  --depth_evaluation_examples_per_setting 256 \
+  --ood_n_depth_evaluation_modulus_bits '[12,14,16]' \
+  --ood_n_depth_evaluation_examples_per_setting 256 \
   --train_fraction 0.9 --test_fraction 0.1 \
   --split_group prompt --seed 45 --separate_input_output true
 
@@ -96,6 +128,10 @@ python -m data.squaring_mod \
   --modulus_bits '[14,18,22]' --fixed_time_steps 8 \
   --ood_time_steps '[16]' \
   --examples_per_setting 30000 --ood_examples_per_setting 3000 \
+  --depth_evaluation_time_steps '[1,2,4,8,16,32,64]' \
+  --depth_evaluation_examples_per_setting 256 \
+  --ood_n_depth_evaluation_modulus_bits '[16,20,24]' \
+  --ood_n_depth_evaluation_examples_per_setting 256 \
   --train_fraction 0.9 --test_fraction 0.1 \
   --split_group prompt --seed 45 --separate_input_output true
 
@@ -105,5 +141,9 @@ python -m data.squaring_mod \
   --modulus_bits '[12,14,16]' \
   --time_steps '[2,4,8]' --ood_time_steps '[16]' \
   --examples_per_setting 10000 --ood_examples_per_setting 1000 \
+  --depth_evaluation_time_steps '[1,2,4,8,16,32,64]' \
+  --depth_evaluation_examples_per_setting 256 \
+  --ood_n_depth_evaluation_modulus_bits '[13,15,18]' \
+  --ood_n_depth_evaluation_examples_per_setting 256 \
   --train_fraction 0.9 --test_fraction 0.1 \
   --split_group prompt --seed 45 --separate_input_output true

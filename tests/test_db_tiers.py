@@ -168,6 +168,10 @@ class TierDatabaseTests(unittest.TestCase):
         self.assertIn("r.status = 'succeeded'", query)
         self.assertIn("PARTITION BY u.id", query)
         self.assertIn("participant_rank = 1", query)
+        self.assertIn("max_certified_time_steps", query)
+        self.assertIn("ood_n_max_certified_time_steps", query)
+        self.assertIn("COALESCE(max_certified_time_steps, 0) DESC", query)
+        self.assertIn("COALESCE(ood_n_max_certified_time_steps, 0) DESC", query)
 
 
 if __name__ == "__main__":

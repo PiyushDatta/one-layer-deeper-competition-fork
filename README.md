@@ -50,7 +50,7 @@ python -m unittest discover -s tests
 10. Optimizer state, activations, and temporary workspace may use remaining VRAM. OOM or timeout fails the run.
 11. Easy provides 60 H100 training seconds, Medium 600 seconds, and Hard 3,600 seconds. Model construction, submission import, and compilation consume the budget.
 12. A custom training loss receives final logits, labels, and the model's auxiliary output and returns one differentiable finite scalar. The evaluator performs backward.
-13. Each final checkpoint is evaluated once with a separate time budget equal to half its training allowance. The evaluator uses fixed loss and exact accuracy, and the score is mean exact accuracy across fixed evaluation splits and seeds.
+13. Each final checkpoint is evaluated once with a separate time budget equal to half its training allowance. Easy and Medium score mean exact accuracy. Hard ranks by the largest consecutively certified T on fresh prompts using modulus identities seen during training, then breaks ties by the largest consecutively certified T on unseen modulus identities. Both use T=1,2,4,8,16,32,64; every example in a rung must be exactly correct, and certification must form a consecutive prefix.
 14. Data inspection, task-specific solvers, custom training loops, participant-controlled backward passes, and manifest overrides are not allowed.
 15. Repeated rule-breaking will get you banned. We still encourage creativity: discussing possible loopholes on Discord or testing one in a submission won't get you banned.
 16. The metric recorder for a Hard run must not be exploited. Any attempt to exploit it will result in an immediate ban.
@@ -107,6 +107,12 @@ private hidden evaluator.
 - **Hard:** dataset `h1`, 3,600 training seconds, 1 accepted attempt per UTC day.
 
 Easy and Medium are practice tiers. The public leaderboard ranks only each participant's best successful Hard submission. Failed evaluations count after acceptance; authentication and validation rejections do not. Source and detailed results remain private.
+
+Easy and Medium expose the same `Max T` and `OOD N Max T` fields as Hard, using the common T=1,2,4,8,16,32,64 ladder. Each profile remains specific to its dataset: Max T evaluates modulus identities used by the training dataset, while OOD N Max T evaluates unseen identities at nearby dataset-scale modulus sizes. These practice-tier profiles are diagnostic and do not change their exact-accuracy scores.
+
+Hard leaderboard rows report two certified depth values over private hidden profiles. **Max T** measures familiar problem families, while **OOD N Max T** measures held-out problem families. The evaluator details and data remain private.
+
+A value is the largest T for which that rung and every lower rung have 100% exact-example accuracy. The leaderboard ranks by Max T, then OOD N Max T, then earlier submission time. Exact-accuracy measurements and individual rung results remain private diagnostics and do not affect Hard ranking.
 
 ## CLI
 

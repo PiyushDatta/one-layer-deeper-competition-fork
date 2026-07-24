@@ -590,11 +590,14 @@ class Database:
                             r.manifest_name, r.tier, r.dataset_id,
                             r.dataset_label, r.finished_at,
                             u.id AS user_id, u.display_name AS submitter,
-                            (r.result -> 'score' ->> 'mean_exact_accuracy')::double precision AS score,
+                            (r.result -> 'depth_profile' ->> 'max_certified_time_steps')::integer AS max_certified_time_steps,
+                            (r.result -> 'depth_profile' ->> 'ood_n_max_certified_time_steps')::integer AS ood_n_max_certified_time_steps,
+                            COALESCE((r.result -> 'depth_profile' ->> 'ood_n_profile_available')::boolean, false) AS ood_n_profile_available,
                             ROW_NUMBER() OVER (
                                 PARTITION BY u.id
                                 ORDER BY
-                                    (r.result -> 'score' ->> 'mean_exact_accuracy')::double precision DESC,
+                                    COALESCE((r.result -> 'depth_profile' ->> 'max_certified_time_steps')::integer, 0) DESC,
+                                    COALESCE((r.result -> 'depth_profile' ->> 'ood_n_max_certified_time_steps')::integer, 0) DESC,
                                     s.created_at,
                                     s.id
                             ) AS participant_rank
@@ -605,10 +608,13 @@ class Database:
                     )
                     SELECT id, filename, status, created_at, manifest_name,
                            tier, dataset_id, dataset_label, finished_at,
-                           submitter, score
+                           submitter, max_certified_time_steps,
+                           ood_n_max_certified_time_steps, ood_n_profile_available
                     FROM ranked
                     WHERE participant_rank = 1
-                    ORDER BY score DESC, created_at, id
+                    ORDER BY COALESCE(max_certified_time_steps, 0) DESC,
+                             COALESCE(ood_n_max_certified_time_steps, 0) DESC,
+                             created_at, id
                     """
                 ).fetchall()
             )
@@ -625,7 +631,11 @@ class Database:
                         r.id AS run_id, r.manifest_name, r.tier,
                         r.dataset_id, r.dataset_label, r.status,
                         r.started_at, r.deadline_at, r.finished_at,
-                        (r.result -> 'score' ->> 'mean_exact_accuracy')::double precision AS score
+                        (r.result -> 'score' ->> 'mean_exact_accuracy')::double precision AS score,
+                        (r.result -> 'depth_profile' ->> 'depth_factor')::integer AS depth_factor,
+                        (r.result -> 'depth_profile' ->> 'max_certified_time_steps')::integer AS max_certified_time_steps,
+                        (r.result -> 'depth_profile' ->> 'ood_n_max_certified_time_steps')::integer AS ood_n_max_certified_time_steps,
+                        COALESCE((r.result -> 'depth_profile' ->> 'ood_n_profile_available')::boolean, false) AS ood_n_profile_available
                     FROM submissions s
                     JOIN runs r ON r.submission_id = s.id
                     WHERE s.user_id = %s
@@ -646,8 +656,14 @@ class Database:
                     r.finished_at,
                     u.display_name AS submitter,
                     CASE WHEN r.status = 'succeeded'
-                        THEN (r.result -> 'score' ->> 'mean_exact_accuracy')::double precision
-                    END AS score
+                        THEN (r.result -> 'depth_profile' ->> 'max_certified_time_steps')::integer
+                    END AS max_certified_time_steps,
+                    CASE WHEN r.status = 'succeeded'
+                        THEN (r.result -> 'depth_profile' ->> 'ood_n_max_certified_time_steps')::integer
+                    END AS ood_n_max_certified_time_steps,
+                    CASE WHEN r.status = 'succeeded'
+                        THEN COALESCE((r.result -> 'depth_profile' ->> 'ood_n_profile_available')::boolean, false)
+                    END AS ood_n_profile_available
                 FROM submissions s
                 JOIN runs r ON r.submission_id = s.id
                 JOIN users u ON u.id = s.user_id

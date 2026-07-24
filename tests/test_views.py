@@ -182,7 +182,8 @@ class CompetitionPrivacyTests(unittest.TestCase):
             "dataset_id": "h1",
             "dataset_label": "H1 · Hidden evaluation",
             "submitter": "Ada Lovelace",
-            "score": 0.75,
+            "max_certified_time_steps": 32,
+            "ood_n_max_certified_time_steps": 16,
             # Private fields must never be rendered even if a caller supplies them.
             "name": "secret architecture name",
             "description": "secret architecture description",
@@ -192,12 +193,15 @@ class CompetitionPrivacyTests(unittest.TestCase):
             "result": {"seeds": [{"secret": "private-seed-payload"}]},
         }
 
-    def test_leaderboard_shows_identity_file_and_score_only(self) -> None:
+    def test_leaderboard_shows_identity_file_and_max_t_only(self) -> None:
         page = leaderboard_page([self.row])
         self.assertIn("Ada Lovelace", page)
         self.assertIn("submission.py", page)
         self.assertNotIn("<th>Status</th>", page)
-        self.assertIn("75.00%", page)
+        self.assertIn("Max T", page)
+        self.assertIn("OOD N Max T", page)
+        self.assertIn('<td class="score">32</td>', page)
+        self.assertIn('<td class="score">16</td>', page)
         self.assertIn("source and run details remain private", page)
         self.assertNotIn("secret architecture", page)
         self.assertNotIn("secret-modal-call", page)

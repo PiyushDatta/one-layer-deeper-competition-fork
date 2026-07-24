@@ -88,10 +88,11 @@ def problem_page() -> str:
       </article>
 
       <article class="panel problem-copy">
-        <div class="panel-head"><h2>How it is scored</h2><span>Exact accuracy</span></div>
+        <div class="panel-head"><h2>How it is scored</h2><span>Certified Max T</span></div>
         <div class="problem-card-body">
           <p>An example counts as correct only when every target token is correct. A nearly right residue earns no partial credit for that example.</p>
-          <p>Hard uses a private hidden evaluator. Easy and Medium equally average test and their merged out-of-distribution split.</p>
+          <p>Hard ranks by the largest consecutively certified T on modulus identities seen during training, then by the corresponding Max T on unseen interpolation and extrapolation modulus sizes. Every example in every rung through Max T must be exactly correct.</p>
+          <p><strong>Hard is a hidden task evaluation and may change aspects of the recurrence itself; do not assume it is repeated squaring.</strong></p>
         </div>
       </article>
     </section>
@@ -117,19 +118,27 @@ def problem_page() -> str:
     return _layout("Problem", content)
 
 
+def _max_t_text(value, *, available: bool = True) -> str:
+    if not available:
+        return "N/A"
+    return "<1" if value is None or int(value) < 1 else str(int(value))
+
+
 def leaderboard_page(rows: list[dict]) -> str:
     ranks = {str(row["id"]): rank for rank, row in enumerate(rows, start=1)}
     table_rows = []
     for row in rows:
         rank = ranks.get(str(row["id"]), "—")
-        score = "—" if row["score"] is None else f"{100 * row['score']:.2f}%"
+        max_t = _max_t_text(row.get("max_certified_time_steps"))
+        ood_n_max_t = _max_t_text(row.get("ood_n_max_certified_time_steps"))
         submitter = row["submitter"]
         table_rows.append(
             f"""<tr>
               <td class="rank">{rank}</td>
               <td><a class="entry" href="/submissions/{row["id"]}">{escape(submitter)}</a>
                   <span class="muted block">{escape(row["filename"])}</span></td>
-              <td class="score">{score}</td>
+              <td class="score">{escape(max_t)}</td>
+              <td class="score">{escape(ood_n_max_t)}</td>
               <td class="muted">{escape(str(row.get("dataset_label") or row["manifest_name"]))}</td>
             </tr>"""
         )
@@ -147,9 +156,9 @@ def leaderboard_page(rows: list[dict]) -> str:
     </section>
     <section class="panel">
       <div class="panel-head"><h2>Leaderboard</h2><span>{len(rows)} ranked</span></div>
-      <div class="notice"><strong>Hard leaderboard:</strong> each participant is ranked once by their best successful Hard score. Easy and Medium are private practice runs; source and run details remain private.</div>
+      <div class="notice"><strong>Higher is better.</strong> Max T is the hardest problem depth solved perfectly using familiar number sizes. OOD N Max T is the hardest depth solved perfectly using new number sizes. The leaderboard ranks by Max T first, then OOD N Max T. Each participant appears once with their best successful Hard run; source and run details remain private.</div>
       <div class="table-wrap"><table>
-        <thead><tr><th>#</th><th>Participant / file</th><th>Exact accuracy</th><th>Dataset</th></tr></thead>
+        <thead><tr><th>#</th><th>Participant / file</th><th>Max T</th><th>OOD N Max T</th><th>Dataset</th></tr></thead>
         <tbody>{"".join(table_rows)}</tbody>
       </table></div>{empty}
     </section>"""
@@ -357,8 +366,17 @@ one-layer submit submission.py --tier easy --dataset e1 --wait</code></pre>
 
 
 def submission_page(row: dict) -> str:
-    score = row.get("score")
-    score_text = "Pending" if score is None else f"{100 * score:.2f}%"
+    if row["status"] == "succeeded":
+        max_t = _max_t_text(row.get("max_certified_time_steps"))
+        ood_n_available = row.get("ood_n_profile_available")
+        if ood_n_available is None:
+            ood_n_available = row.get("ood_n_max_certified_time_steps") is not None
+        ood_n_max_t = _max_t_text(
+            row.get("ood_n_max_certified_time_steps"), available=ood_n_available
+        )
+    else:
+        max_t = "Pending"
+        ood_n_max_t = "Pending"
     submitter = row["submitter"]
     failure = (
         '<div class="error"><strong>Evaluation failed.</strong> The participant can inspect the private error through the authenticated CLI.</div>'
@@ -368,7 +386,7 @@ def submission_page(row: dict) -> str:
     content = f"""
     <section class="detail-hero"><div><p class="eyebrow">Participant</p><h1>{escape(submitter)}</h1>
     <p class="lede">{escape(row["filename"])}</p></div>
-    <div class="score-card"><span>Exact accuracy</span><strong>{score_text}</strong><span class="status {escape(row["status"])}">{escape(row["status"])}</span></div></section>
+    <div class="score-card"><span>Max T</span><strong>{escape(max_t)}</strong><span>OOD N Max T</span><b>{escape(ood_n_max_t)}</b><span class="status {escape(row["status"])}">{escape(row["status"])}</span></div></section>
     {failure}
     <section class="facts panel"><div><span>Participant</span><strong>{escape(submitter)}</strong></div>
     <div><span>Filename</span><strong>{escape(row["filename"])}</strong></div>

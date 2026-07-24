@@ -18,6 +18,7 @@ from data.squaring_mod import generate_squaring_mod_smoke_dataset
 
 from benchmark.runner import (
     _evaluate,
+    _depth_split_names,
     _resolve_batch_sizes,
     _run_seed,
     _scoring_split_names,
@@ -51,6 +52,24 @@ class RunnerBudgetTests(unittest.TestCase):
                 }
             ),
             ("test", "ood_t", "ood_n_t"),
+        )
+        dataloaders = {
+            "train": object(),
+            "test": object(),
+            "depth_t_64": object(),
+            "depth_t_2": object(),
+            "depth_t_16": object(),
+            "depth_ood_n_t_2": object(),
+            "depth_ood_n_t_64": object(),
+        }
+        self.assertEqual(_scoring_split_names(dataloaders), ("test",))
+        self.assertEqual(
+            _depth_split_names(dataloaders),
+            ("depth_t_2", "depth_t_16", "depth_t_64"),
+        )
+        self.assertEqual(
+            _depth_split_names(dataloaders, "depth_ood_n_t_"),
+            ("depth_ood_n_t_2", "depth_ood_n_t_64"),
         )
 
     def test_squaring_mod_generation_omits_and_removes_eval_split(self) -> None:
@@ -244,6 +263,98 @@ class RunnerBudgetTests(unittest.TestCase):
             manifest.data.eval_batch_size,
         )
         self.assertEqual(result["evaluation"], {"test": evaluation})
+
+    def test_depth_profile_requires_a_perfect_prefix_but_evaluates_later_rungs(self) -> None:
+        manifest = load_manifest(ROOT / "benchmark" / "manifests" / "smoke_cpu.json")
+        model_spec = ModelSpec(1, 1, 2)
+
+        def build_model(spec):
+            model = torch.nn.Linear(1, 1)
+            model.config = SimpleNamespace(
+                vocab_size=spec.vocab_size,
+                max_seq_len=spec.max_seq_len,
+            )
+            return model
+
+        submission = Submission(
+            build_model=build_model,
+            build_optimizer=lambda model, spec: OptimizerBundle(
+                torch.optim.SGD(model.parameters(), lr=0.1)
+            ),
+        )
+        dataset = torch.utils.data.TensorDataset(torch.arange(4))
+        loader = torch.utils.data.DataLoader(dataset, batch_size=4)
+        dataloaders = {
+            "train": loader,
+            "test": loader,
+            "depth_t_1": loader,
+            "depth_t_2": loader,
+            "depth_t_4": loader,
+            "depth_t_8": loader,
+            "depth_ood_n_t_1": loader,
+            "depth_ood_n_t_2": loader,
+            "depth_ood_n_t_4": loader,
+            "depth_ood_n_t_8": loader,
+        }
+        primary = {
+            "loss": 1.0,
+            "exact_accuracy": 0.5,
+            "correct_examples": 2,
+            "example_count": 4,
+        }
+        perfect = {
+            "loss": 0.0,
+            "exact_accuracy": 1.0,
+            "correct_examples": 4,
+            "example_count": 4,
+        }
+        failed = {
+            "loss": 0.1,
+            "exact_accuracy": 0.75,
+            "correct_examples": 3,
+            "example_count": 4,
+        }
+
+        with (
+            patch("benchmark.runner._train", return_value=(0.0, 1, 1.0, 0)),
+            patch(
+                "benchmark.runner._evaluate",
+                side_effect=(
+                    primary, perfect, perfect, failed, perfect,
+                    perfect, failed, perfect, perfect,
+                ),
+            ) as evaluate,
+        ):
+            result = _run_seed(
+                submission,
+                manifest,
+                model_spec,
+                torch.device("cpu"),
+                seed=74,
+                budget_seconds=10.0,
+                submission_load_seconds=0.0,
+                dataloaders=dataloaders,
+            )
+
+        self.assertEqual(evaluate.call_count, 9)
+        self.assertEqual(result["evaluation"], {"test": primary})
+        self.assertEqual(result["depth_profile"]["max_certified_time_steps"], 2)
+        self.assertEqual(result["depth_profile"]["depth_factor"], 2)
+        self.assertEqual(
+            [rung["status"] for rung in result["depth_profile"]["rungs"]],
+            ["certified", "certified", "failed", "passed_uncertified"],
+        )
+
+        self.assertEqual(
+            result["depth_profile"]["ood_n_max_certified_time_steps"], 1
+        )
+        self.assertEqual(
+            [
+                rung["status"]
+                for rung in result["depth_profile"]["ood_n_rungs"]
+            ],
+            ["certified", "failed", "passed_uncertified", "passed_uncertified"],
+        )
 
     def test_dataset_files_cannot_be_reopened_after_preload(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

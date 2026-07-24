@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 import math
 import random
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 
@@ -48,6 +49,19 @@ SMOKE_EXAMPLES_PER_SETTING = 100
 # separate-input/output representation.
 SMOKE_MAX_SEQ_LEN = 10
 ID_SPLITS: tuple[str, ...] = ("train", "test")
+Transition = Callable[[int, int, int, int], int]
+
+
+class Tokenizer(Protocol):
+    def __call__(
+        self,
+        modulus: int,
+        x: int,
+        time_steps: int,
+        result: int,
+        *,
+        separate_input_output: bool = False,
+    ) -> tuple[list[int], list[int]]: ...
 
 
 class SquaringModTokenizedDataset(TokenizedCountingDataset):
@@ -121,6 +135,11 @@ class SquaringModGenerationConfig:
     factor_modulus: int | None = None
     factor_remainder: int | None = None
     separate_ood_splits: bool = False
+    depth_evaluation_time_steps: list[int] = field(default_factory=list)
+    depth_evaluation_examples_per_setting: int | None = None
+    depth_evaluation_exhaustive_x: bool = False
+    ood_n_depth_evaluation_modulus_bits: list[int] = field(default_factory=list)
+    ood_n_depth_evaluation_examples_per_setting: int | None = None
 
     def __post_init__(self) -> None:
         fixed_values = (self.fixed_p, self.fixed_q)
@@ -183,6 +202,83 @@ class SquaringModGenerationConfig:
             raise ValueError("time_steps must not contain duplicates")
         if len(set(self.ood_time_steps)) != len(self.ood_time_steps):
             raise ValueError("ood_time_steps must not contain duplicates")
+        if len(set(self.depth_evaluation_time_steps)) != len(
+            self.depth_evaluation_time_steps
+        ):
+            raise ValueError("depth_evaluation_time_steps must not contain duplicates")
+        if any(value < 1 for value in self.depth_evaluation_time_steps):
+            raise ValueError("depth_evaluation_time_steps must be positive")
+        if len(set(self.ood_n_depth_evaluation_modulus_bits)) != len(
+            self.ood_n_depth_evaluation_modulus_bits
+        ):
+            raise ValueError(
+                "ood_n_depth_evaluation_modulus_bits must not contain duplicates"
+            )
+        if any(value < 4 for value in self.ood_n_depth_evaluation_modulus_bits):
+            raise ValueError(
+                "all ood_n_depth_evaluation_modulus_bits values must be at least 4"
+            )
+        id_modulus_bits = (
+            {int((self.fixed_p * self.fixed_q).bit_length())}
+            if self.fixed_p is not None and self.fixed_q is not None
+            else set(self.modulus_bits)
+        )
+        overlapping_ood_n_bits = (
+            id_modulus_bits & set(self.ood_n_depth_evaluation_modulus_bits)
+        )
+        if overlapping_ood_n_bits:
+            raise ValueError(
+                "ood_n_depth_evaluation_modulus_bits must not overlap "
+                "in-distribution modulus sizes; overlapping values: "
+                f"{sorted(overlapping_ood_n_bits)}"
+            )
+        if (
+            self.depth_evaluation_examples_per_setting is not None
+            and self.depth_evaluation_examples_per_setting < 1
+        ):
+            raise ValueError(
+                "depth_evaluation_examples_per_setting must be positive when provided"
+            )
+        if (
+            self.ood_n_depth_evaluation_examples_per_setting is not None
+            and self.ood_n_depth_evaluation_examples_per_setting < 1
+        ):
+            raise ValueError(
+                "ood_n_depth_evaluation_examples_per_setting must be positive when provided"
+            )
+        if self.depth_evaluation_time_steps and self.split_group not in ("prompt", "modulus"):
+            raise ValueError(
+                "depth_evaluation_time_steps requires split_group=prompt or modulus"
+            )
+        if self.ood_n_depth_evaluation_modulus_bits and self.split_group not in ("prompt", "modulus"):
+            raise ValueError(
+                "ood_n_depth_evaluation_modulus_bits requires split_group=prompt or modulus"
+            )
+        if self.ood_n_depth_evaluation_modulus_bits and not self.depth_evaluation_time_steps:
+            raise ValueError(
+                "ood_n_depth_evaluation_modulus_bits requires depth_evaluation_time_steps"
+            )
+        if self.ood_n_depth_evaluation_modulus_bits and (
+            self.ood_n_depth_evaluation_examples_per_setting is None
+        ):
+            raise ValueError(
+                "ood_n_depth_evaluation_examples_per_setting is required with "
+                "ood_n_depth_evaluation_modulus_bits"
+            )
+        if self.depth_evaluation_exhaustive_x and (
+            self.fixed_p is None or self.fixed_q is None
+        ):
+            raise ValueError(
+                "depth_evaluation_exhaustive_x requires fixed_p and fixed_q"
+            )
+        if self.depth_evaluation_time_steps and (
+            self.depth_evaluation_examples_per_setting is None
+            and not self.depth_evaluation_exhaustive_x
+        ):
+            raise ValueError(
+                "depth_evaluation_examples_per_setting is required with "
+                "depth_evaluation_time_steps"
+            )
         if set(in_distribution_time_steps) & set(self.ood_time_steps):
             raise ValueError("ood_time_steps must not overlap training time steps")
         if self.fixed_p is None:
@@ -351,17 +447,28 @@ def tokenize_squaring_mod_with_result(
     return input_ids, labels
 
 
-def generate_squaring_mod_dataset(config: SquaringModGenerationConfig) -> dict[str, Any]:
+def generate_squaring_mod_dataset(
+    config: SquaringModGenerationConfig,
+    *,
+    transition: Transition = trapdoor_squaring_mod,
+    tokenizer: Tokenizer = tokenize_squaring_mod_with_result,
+) -> dict[str, Any]:
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     rng = random.Random(config.seed)
     if config.split_group == "x":
-        records = _generate_x_grouped_records(config=config, rng=rng)
+        records = _generate_x_grouped_records(
+            config=config, rng=rng, transition=transition, tokenizer=tokenizer
+        )
     elif config.split_group == "modulus":
-        records = _generate_modulus_grouped_records(config=config, rng=rng)
+        records = _generate_modulus_grouped_records(
+            config=config, rng=rng, transition=transition, tokenizer=tokenizer
+        )
     else:
-        records = _generate_prompt_grouped_records(config=config, rng=rng)
+        records = _generate_prompt_grouped_records(
+            config=config, rng=rng, transition=transition, tokenizer=tokenizer
+        )
 
     write_split_files(output_dir, records)
     dataset_config = _dataset_config(config, records)
@@ -383,9 +490,41 @@ def _generate_prompt_grouped_records(
     *,
     config: SquaringModGenerationConfig,
     rng: random.Random,
+    transition: Transition,
+    tokenizer: Tokenizer,
 ) -> list[Record]:
     records: list[Record] = []
     seen_prompts: set[tuple[int, int, int]] = set()
+    if (
+        config.fixed_p is not None
+        and config.fixed_q is not None
+        and config.depth_evaluation_time_steps
+    ):
+        assert config.fixed_p is not None and config.fixed_q is not None
+        modulus = config.fixed_p * config.fixed_q
+        units = [x for x in range(1, modulus) if math.gcd(x, modulus) == 1]
+        required_per_time_step = max(
+            config.examples_per_setting,
+            config.effective_ood_examples_per_setting,
+        )
+        reserve_count = (
+            len(units) - required_per_time_step
+            if config.depth_evaluation_exhaustive_x
+            else config.depth_evaluation_examples_per_setting
+        )
+        assert reserve_count is not None
+        if reserve_count < 1:
+            raise ValueError(
+                "fixed-N depth evaluation requires at least one reserved unit"
+            )
+        if required_per_time_step + reserve_count > len(units):
+            raise ValueError(
+                "fixed-N depth evaluation lacks enough unique x values for "
+                "the ordinary and reserved profile cohorts"
+            )
+        reserved_x = set(rng.sample(units, reserve_count))
+        for time_steps in (*_time_settings(config), *config.ood_time_steps):
+            seen_prompts.update((modulus, x, time_steps) for x in reserved_x)
     for modulus_bits in _modulus_settings(config):
         for time_steps in _time_settings(config):
             records.extend(
@@ -396,6 +535,8 @@ def _generate_prompt_grouped_records(
                     time_steps=time_steps,
                     start_index=len(records),
                     seen_prompts=seen_prompts,
+                    transition=transition,
+                    tokenizer=tokenizer,
                 )
             )
     for modulus_bits in _modulus_settings(config):
@@ -408,15 +549,137 @@ def _generate_prompt_grouped_records(
                     time_steps=time_steps,
                     start_index=len(records),
                     seen_prompts=seen_prompts,
+                    transition=transition,
+                    tokenizer=tokenizer,
                 )
             )
+    if config.depth_evaluation_time_steps:
+        records.extend(
+            _generate_prompt_depth_evaluation_records(
+
+
+                config=config,
+                rng=rng,
+                existing_records=records,
+                transition=transition,
+                tokenizer=tokenizer,
+            )
+        )
+        records.extend(
+            _generate_ood_n_depth_evaluation_records(
+                config=config,
+                rng=rng,
+                existing_records=records,
+                transition=transition,
+                tokenizer=tokenizer,
+            )
+        )
     return records
 
 
+def _generate_prompt_depth_evaluation_records(
+    *,
+    config: SquaringModGenerationConfig,
+    rng: random.Random,
+    existing_records: list[Record],
+    transition: Transition,
+    tokenizer: Tokenizer,
+) -> list[Record]:
+    """Build matched Easy depth cohorts for fixed- or sampled-modulus data."""
+
+    matched_by_bits: dict[int | None, list[tuple[int, int, int]]] = {}
+    if config.depth_evaluation_exhaustive_x:
+        assert config.fixed_p is not None and config.fixed_q is not None
+        modulus = config.fixed_p * config.fixed_q
+        used_pairs = {
+            (int(record["modulus"]), int(record["x"]))
+            for record in existing_records
+        }
+        matched_by_bits[None] = [
+            (config.fixed_p, config.fixed_q, x)
+            for x in range(1, modulus)
+            if math.gcd(x, modulus) == 1
+            and (modulus, x) not in used_pairs
+        ]
+        if not matched_by_bits[None]:
+            raise ValueError(
+                "depth_evaluation_exhaustive_x found no held-out fixed-N prompts"
+            )
+    else:
+        count = config.depth_evaluation_examples_per_setting
+        assert count is not None
+        used_pairs = {
+            (int(record["modulus"]), int(record["x"]))
+            for record in existing_records
+        }
+        if config.fixed_p is not None and config.fixed_q is not None:
+            factor_pools: dict[int | None, list[tuple[int, int]]] = {
+                None: [(config.fixed_p, config.fixed_q)]
+            }
+        else:
+            factor_pools = {}
+            for modulus_bits in config.modulus_bits:
+                training_moduli = {
+                    int(record["modulus"])
+                    for record in existing_records
+                    if record["split"] == "train"
+                    and record["configured_modulus_bits"] == modulus_bits
+                }
+                selected_moduli = rng.sample(
+                    sorted(training_moduli), min(len(training_moduli), count)
+                )
+                factor_pools[modulus_bits] = [
+                    _factor_semiprime(modulus) for modulus in selected_moduli
+                ]
+        for modulus_bits, factor_pool in factor_pools.items():
+            if not factor_pool:
+                raise ValueError(
+                    f"no training moduli available for depth profile at {modulus_bits} bits"
+                )
+            weights = [(p - 1) * (q - 1) for p, q in factor_pool]
+            matched: list[tuple[int, int, int]] = []
+            for _ in range(count):
+                for _ in range(10_000):
+                    p, q = rng.choices(factor_pool, weights=weights, k=1)[0]
+                    modulus = p * q
+                    x = _sample_unit(modulus=modulus, rng=rng)
+                    pair = (modulus, x)
+                    if pair not in used_pairs:
+                        used_pairs.add(pair)
+                        matched.append((p, q, x))
+                        break
+                else:
+                    raise ValueError(
+                        "could not sample a fresh seen-N depth pair after 10,000 attempts"
+                    )
+            matched_by_bits[modulus_bits] = matched
+
+    records: list[Record] = []
+    for time_steps in config.depth_evaluation_time_steps:
+        split = f"depth_t_{time_steps}"
+        for modulus_bits, matched in matched_by_bits.items():
+            for p, q, x in matched:
+                records.append(
+                    _build_record(
+                        config=config,
+                        p=p,
+                        q=q,
+                        x=x,
+                        time_steps=time_steps,
+                        split=split,
+                        index=len(existing_records) + len(records),
+                        modulus_bits=modulus_bits,
+                        transition=transition,
+                        tokenizer=tokenizer,
+                    )
+                )
+    return records
 def _generate_x_grouped_records(
     *,
     config: SquaringModGenerationConfig,
     rng: random.Random,
+    transition: Transition,
+    tokenizer: Tokenizer,
 ) -> list[Record]:
     if config.fixed_p is None or config.fixed_q is None:
         raise ValueError("split_group=x requires fixed factors")
@@ -450,6 +713,8 @@ def _generate_x_grouped_records(
                         split=split,
                         index=len(records),
                         modulus_bits=None,
+                        transition=transition,
+                        tokenizer=tokenizer,
                     )
                 )
 
@@ -479,6 +744,8 @@ def _generate_x_grouped_records(
                         split=split,
                         index=len(records),
                         modulus_bits=None,
+                        transition=transition,
+                        tokenizer=tokenizer,
                     )
                 )
     return records
@@ -488,6 +755,8 @@ def _generate_modulus_grouped_records(
     *,
     config: SquaringModGenerationConfig,
     rng: random.Random,
+    transition: Transition,
+    tokenizer: Tokenizer,
 ) -> list[Record]:
     split_counts = _id_split_counts(config)
     factor_pools_by_bits: dict[int, dict[str, list[tuple[int, int]]]] = {}
@@ -527,6 +796,8 @@ def _generate_modulus_grouped_records(
                         split=split,
                         start_index=len(records),
                         seen_prompts=seen_prompts,
+                        transition=transition,
+                        tokenizer=tokenizer,
                     )
                 )
 
@@ -554,10 +825,171 @@ def _generate_modulus_grouped_records(
                         split=split,
                         start_index=len(records),
                         seen_prompts=seen_prompts,
+                        transition=transition,
+                        tokenizer=tokenizer,
+                    )
+                )
+    if config.depth_evaluation_time_steps:
+        records.extend(
+            _generate_matched_depth_evaluation_records(
+                config=config,
+                rng=rng,
+                factor_pools_by_bits=factor_pools_by_bits,
+                existing_records=records,
+                transition=transition,
+                tokenizer=tokenizer,
+            )
+        )
+        records.extend(
+            _generate_ood_n_depth_evaluation_records(
+                config=config,
+                rng=rng,
+                existing_records=records,
+                transition=transition,
+                tokenizer=tokenizer,
+            )
+        )
+    return records
+
+
+
+def _generate_matched_depth_evaluation_records(
+    *,
+    config: SquaringModGenerationConfig,
+    rng: random.Random,
+    factor_pools_by_bits: dict[int, dict[str, list[tuple[int, int]]]],
+    existing_records: list[Record],
+    transition: Transition,
+    tokenizer: Tokenizer,
+) -> list[Record]:
+    """Build matched, evaluator-only depth cohorts from training-pool moduli."""
+
+    count = config.depth_evaluation_examples_per_setting
+    if count is None:
+        return []
+    used_pairs = {
+        (int(record["modulus"]), int(record["x"])) for record in existing_records
+    }
+    matched_by_bits: dict[int, list[tuple[int, int, int]]] = {}
+    for modulus_bits in config.modulus_bits:
+        training_moduli = {
+            int(record["modulus"])
+            for record in existing_records
+            if record["split"] == "train"
+            and record["configured_modulus_bits"] == modulus_bits
+        }
+        factor_pool = [
+            pair
+            for pair in factor_pools_by_bits[modulus_bits]["train"]
+            if pair[0] * pair[1] in training_moduli
+        ]
+        weights = [(p - 1) * (q - 1) for p, q in factor_pool]
+        matched: list[tuple[int, int, int]] = []
+        for _ in range(count):
+            for _ in range(10_000):
+                p, q = rng.choices(factor_pool, weights=weights, k=1)[0]
+                modulus = p * q
+                x = _sample_unit(modulus=modulus, rng=rng)
+                pair = (modulus, x)
+                if pair not in used_pairs:
+                    used_pairs.add(pair)
+                    matched.append((p, q, x))
+                    break
+            else:
+                raise ValueError(
+                    "could not sample a fresh matched depth-evaluation prompt "
+                    "after 10,000 attempts"
+                )
+        matched_by_bits[modulus_bits] = matched
+
+    records: list[Record] = []
+    for time_steps in config.depth_evaluation_time_steps:
+        split = f"depth_t_{time_steps}"
+        for modulus_bits in config.modulus_bits:
+            for p, q, x in matched_by_bits[modulus_bits]:
+                records.append(
+                    _build_record(
+                        config=config,
+                        p=p,
+                        q=q,
+                        x=x,
+                        time_steps=time_steps,
+                        split=split,
+                        index=len(existing_records) + len(records),
+                        modulus_bits=modulus_bits,
+                        transition=transition,
+                        tokenizer=tokenizer,
                     )
                 )
     return records
 
+
+def _generate_ood_n_depth_evaluation_records(
+    *,
+    config: SquaringModGenerationConfig,
+    rng: random.Random,
+    existing_records: list[Record],
+    transition: Transition,
+    tokenizer: Tokenizer,
+) -> list[Record]:
+    """Build matched depth cohorts at unseen interpolation/extrapolation N sizes."""
+
+    count = config.ood_n_depth_evaluation_examples_per_setting
+    if not config.ood_n_depth_evaluation_modulus_bits or count is None:
+        return []
+    existing_moduli = {
+        int(record["modulus"])
+        for record in existing_records
+    }
+    used_pairs = {
+        (int(record["modulus"]), int(record["x"]))
+        for record in existing_records
+    }
+    matched_by_bits: dict[int, list[tuple[int, int, int]]] = {}
+    for modulus_bits in config.ood_n_depth_evaluation_modulus_bits:
+        matched: list[tuple[int, int, int]] = []
+        for _ in range(count):
+            for _ in range(10_000):
+                p, q = _sample_rsa_factors(
+                    modulus_bits=modulus_bits,
+                    rng=rng,
+                    factor_modulus=config.factor_modulus,
+                    factor_remainder=config.factor_remainder,
+                )
+                modulus = p * q
+                x = _sample_unit(modulus=modulus, rng=rng)
+                pair = (modulus, x)
+                if modulus not in existing_moduli and pair not in used_pairs:
+                    used_pairs.add(pair)
+                    matched.append((p, q, x))
+                    break
+            else:
+                raise ValueError(
+                    "could not sample a fresh OOD-N depth-evaluation prompt "
+                    "after 10,000 attempts"
+                )
+        matched_by_bits[modulus_bits] = matched
+
+    records: list[Record] = []
+    for time_steps in config.depth_evaluation_time_steps:
+        split = f"depth_ood_n_t_{time_steps}"
+        for modulus_bits in config.ood_n_depth_evaluation_modulus_bits:
+            for p, q, x in matched_by_bits[modulus_bits]:
+                records.append(
+                    _build_record(
+                        config=config,
+                        p=p,
+                        q=q,
+                        x=x,
+                        time_steps=time_steps,
+                        split=split,
+                        index=len(existing_records) + len(records),
+                        modulus_bits=modulus_bits,
+                        transition=transition,
+                        tokenizer=tokenizer,
+                    )
+                )
+    return records
 
 def _partition_factor_pairs(
     *,
@@ -609,6 +1041,8 @@ def _generate_records_from_factor_pool(
     split: str,
     start_index: int,
     seen_prompts: set[tuple[int, int, int]],
+    transition: Transition,
+    tokenizer: Tokenizer,
 ) -> list[Record]:
     if not factor_pool:
         raise ValueError(f"empty factor pool for split={split}, modulus_bits={modulus_bits}")
@@ -642,6 +1076,8 @@ def _generate_records_from_factor_pool(
                 split=split,
                 index=start_index + offset,
                 modulus_bits=modulus_bits,
+                transition=transition,
+                tokenizer=tokenizer,
             )
         )
     return records
@@ -655,6 +1091,8 @@ def _generate_setting_records(
     time_steps: int,
     start_index: int,
     seen_prompts: set[tuple[int, int, int]],
+    transition: Transition,
+    tokenizer: Tokenizer,
 ) -> list[Record]:
     split_counts = compute_split_counts(
         config.examples_per_setting,
@@ -675,6 +1113,8 @@ def _generate_setting_records(
                     split=split,
                     index=start_index + len(records),
                     seen_prompts=seen_prompts,
+                    transition=transition,
+                    tokenizer=tokenizer,
                 )
             )
     return records
@@ -688,6 +1128,8 @@ def _generate_ood_records(
     time_steps: int,
     start_index: int,
     seen_prompts: set[tuple[int, int, int]],
+    transition: Transition,
+    tokenizer: Tokenizer,
 ) -> list[Record]:
     return [
         _generate_record(
@@ -698,6 +1140,8 @@ def _generate_ood_records(
             split="ood",
             index=start_index + offset,
             seen_prompts=seen_prompts,
+            transition=transition,
+            tokenizer=tokenizer,
         )
         for offset in range(config.effective_ood_examples_per_setting)
     ]
@@ -712,6 +1156,8 @@ def _generate_record(
     split: str,
     index: int,
     seen_prompts: set[tuple[int, int, int]],
+    transition: Transition,
+    tokenizer: Tokenizer,
 ) -> Record:
     for _ in range(10_000):
         p, q = _sample_or_fixed_factors(
@@ -739,6 +1185,8 @@ def _generate_record(
         split=split,
         index=index,
         modulus_bits=modulus_bits,
+        transition=transition,
+        tokenizer=tokenizer,
     )
 
 
@@ -752,10 +1200,12 @@ def _build_record(
     split: str,
     index: int,
     modulus_bits: int | None,
+    transition: Transition,
+    tokenizer: Tokenizer,
 ) -> Record:
     modulus = p * q
-    result = trapdoor_squaring_mod(x, time_steps, p, q)
-    input_ids, labels = tokenize_squaring_mod_with_result(
+    result = transition(x, time_steps, p, q)
+    input_ids, labels = tokenizer(
         modulus,
         x,
         time_steps,
@@ -831,6 +1281,17 @@ def _sample_prime(*, bits: int, rng: random.Random) -> int:
             return value
     raise ValueError(f"could not sample a {bits}-bit prime")
 
+
+
+def _factor_semiprime(modulus: int) -> tuple[int, int]:
+    """Recover evaluator-generated prime factors for a seen modulus identity."""
+
+    for p in range(2, math.isqrt(modulus) + 1):
+        if modulus % p == 0:
+            q = modulus // p
+            if is_probable_prime(p) and is_probable_prime(q):
+                return p, q
+    raise ValueError(f"could not recover prime factors for modulus {modulus}")
 
 def _sample_unit(*, modulus: int, rng: random.Random) -> int:
     while True:

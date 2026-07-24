@@ -42,15 +42,34 @@ from .validation import (
 EVALUATION_TIME_FRACTION = 0.5
 SCORING_SPLIT_PRIORITY = ("test", "ood", "ood_t", "ood_n_t")
 NON_SCORING_SPLITS = frozenset(("train", "eval"))
+DEPTH_SPLIT_PREFIX = "depth_t_"
+OOD_N_DEPTH_SPLIT_PREFIX = "depth_ood_n_t_"
 
 
 def _scoring_split_names(dataloaders) -> tuple[str, ...]:
     """Return deterministic scored splits for final measurement."""
 
-    available = set(dataloaders) - NON_SCORING_SPLITS
+    available = {
+        name
+        for name in set(dataloaders) - NON_SCORING_SPLITS
+        if not name.startswith(
+            (DEPTH_SPLIT_PREFIX, OOD_N_DEPTH_SPLIT_PREFIX)
+        )
+    }
     prioritized = [name for name in SCORING_SPLIT_PRIORITY if name in available]
     remaining = sorted(available - set(prioritized))
     return tuple((*prioritized, *remaining))
+
+
+def _depth_split_names(
+    dataloaders, prefix: str = DEPTH_SPLIT_PREFIX
+) -> tuple[str, ...]:
+    names = [
+        name for name in dataloaders if name.startswith(prefix)
+    ]
+    return tuple(
+        sorted(names, key=lambda name: int(name.removeprefix(prefix)))
+    )
 
 
 def _deny_dataset_file_access(data_root: str | Path) -> None:
@@ -398,8 +417,84 @@ def _evaluate(
     if example_count == 0 or loss_count == 0:
         raise ValueError("evaluation split contains no labels")
     accuracy = correct_sum / example_count
-    return {"loss": loss_sum / loss_count, "exact_accuracy": accuracy}
+    return {
+        "loss": loss_sum / loss_count,
+        "exact_accuracy": accuracy,
+        "correct_examples": int(round(correct_sum)),
+        "example_count": example_count,
+    }
 
+
+
+def _evaluate_depth_profile(
+    *,
+    model: nn.Module,
+    dataloaders,
+    manifest: BenchmarkManifest,
+    device: torch.device,
+    deadline: float,
+    budget_seconds: float,
+    seed: int,
+    prefix: str,
+    label: str,
+) -> dict:
+    split_names = _depth_split_names(dataloaders, prefix)
+    ladder = [int(name.removeprefix(prefix)) for name in split_names]
+    rungs = []
+    prefix_solved = True
+    max_certified_time_steps = None
+    for split_name in split_names:
+        time_steps = int(split_name.removeprefix(prefix))
+        try:
+            metrics = _evaluate(
+                model,
+                dataloaders[split_name],
+                manifest,
+                device,
+                deadline=deadline,
+                budget_seconds=budget_seconds,
+            )
+        except TimeoutError:
+            rungs.append(
+                {
+                    "time_steps": time_steps,
+                    "status": "not_completed",
+                    "correct_examples": 0,
+                    "example_count": len(dataloaders[split_name].dataset),
+                    "exact_accuracy": None,
+                }
+            )
+            break
+        solved = metrics["correct_examples"] == metrics["example_count"]
+        prefix_solved = prefix_solved and solved
+        if prefix_solved:
+            max_certified_time_steps = time_steps
+        rungs.append(
+            {
+                "time_steps": time_steps,
+                "status": (
+                    "certified"
+                    if prefix_solved
+                    else "passed_uncertified"
+                    if solved
+                    else "failed"
+                ),
+                "correct_examples": metrics["correct_examples"],
+                "example_count": metrics["example_count"],
+                "exact_accuracy": metrics["exact_accuracy"],
+            }
+        )
+        print(
+            f"seed={seed} profile={label} depth_t={time_steps} "
+            f"exact_accuracy={metrics['exact_accuracy']:.6f} "
+            f"certified={prefix_solved}",
+            flush=True,
+        )
+    return {
+        "ladder": ladder,
+        "max_certified_time_steps": max_certified_time_steps,
+        "rungs": rungs,
+    }
 
 def _run_seed(
     submission: Submission,
@@ -512,6 +607,38 @@ def _run_seed(
                 loss=metrics["loss"],
                 exact_accuracy=metrics["exact_accuracy"],
             )
+    depth_profile = _evaluate_depth_profile(
+        model=model,
+        dataloaders=dataloaders,
+        manifest=manifest,
+        device=device,
+        deadline=evaluation_deadline,
+        budget_seconds=evaluation_budget_seconds,
+        seed=seed,
+        prefix=DEPTH_SPLIT_PREFIX,
+        label="seen_n",
+    )
+    ood_n_depth_profile = _evaluate_depth_profile(
+        model=model,
+        dataloaders=dataloaders,
+        manifest=manifest,
+        device=device,
+        deadline=evaluation_deadline,
+        budget_seconds=evaluation_budget_seconds,
+        seed=seed,
+        prefix=OOD_N_DEPTH_SPLIT_PREFIX,
+        label="ood_n",
+    )
+    depth_profile.update(
+        {
+            "depth_factor": depth_profile["max_certified_time_steps"] or 0,
+            "ood_n_ladder": ood_n_depth_profile["ladder"],
+            "ood_n_max_certified_time_steps": ood_n_depth_profile[
+                "max_certified_time_steps"
+            ],
+            "ood_n_rungs": ood_n_depth_profile["rungs"],
+        }
+    )
     evaluation_seconds = time.monotonic() - evaluation_started_at
 
     return {
@@ -527,6 +654,7 @@ def _run_seed(
         "evaluation_budget_seconds": evaluation_budget_seconds,
         "evaluation_seconds": evaluation_seconds,
         "evaluation": evaluation,
+        "depth_profile": depth_profile,
     }
 
 
@@ -633,6 +761,30 @@ def run_submission_file(
         },
         "seeds": seed_results,
     }
+    if any(seed_result["depth_profile"]["ladder"] for seed_result in seed_results):
+        certified_time_steps = min(
+            seed_result["depth_profile"]["max_certified_time_steps"] or 0
+            for seed_result in seed_results
+        )
+        ood_n_certified_time_steps = min(
+            seed_result["depth_profile"]["ood_n_max_certified_time_steps"] or 0
+            for seed_result in seed_results
+        )
+        result["depth_profile"] = {
+            "ladder": seed_results[0]["depth_profile"]["ladder"],
+            "max_certified_time_steps": certified_time_steps or None,
+            "ood_n_ladder": seed_results[0]["depth_profile"]["ood_n_ladder"],
+            "ood_n_profile_available": bool(
+                seed_results[0]["depth_profile"]["ood_n_ladder"]
+            ),
+            "ood_n_max_certified_time_steps": (
+                ood_n_certified_time_steps or None
+            ),
+            "depth_factor": min(
+                seed_result["depth_profile"]["depth_factor"]
+                for seed_result in seed_results
+            ),
+        }
     if metric_recorder is not None:
         metric_recorder.record_summary(
             completed_steps=sum(

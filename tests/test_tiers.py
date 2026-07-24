@@ -58,7 +58,12 @@ class TierCatalogTests(unittest.TestCase):
         generation_script = (ROOT / "scripts" / "generate_datasets.sh").read_text(
             encoding="utf-8"
         )
-        generation_commands = generation_script.split("python -m data.")[1:]
+        active_script = "\n".join(
+            line
+            for line in generation_script.splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        generation_commands = active_script.split("python -m data.")[1:]
         self.assertEqual(len(generation_commands), 10)
         for command in generation_commands:
             with self.subTest(command=command.splitlines()[0]):
