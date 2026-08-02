@@ -5,7 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 
-SUBMISSION_DEADLINE_LABEL = "August 31 at 10:00 PM PT"
+BETA_END_LABEL = "Sunday, August 2 at 10:00 PM PT"
+SUBMISSION_DEADLINE_LABEL = "Monday, August 31 at 10:00 PM PT"
 SUBMISSION_DEADLINE = datetime(
     2026,
     8,

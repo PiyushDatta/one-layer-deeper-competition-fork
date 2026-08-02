@@ -28,6 +28,7 @@ CONFIG_PATH = Path(
     )
 )
 TERMINAL_STATUSES = {"succeeded", "failed"}
+DEPTH_LADDER = (1, 2, 4, 8, 16, 32, 64)
 
 
 def _server(value: str) -> str:
@@ -56,8 +57,32 @@ def _max_t(row: dict, key: str) -> str:
     if value is None:
         value = profile.get(key)
     if value is None:
-        return "<1" if row.get("status") == "succeeded" else "—"
+        return "None certified" if row.get("status") == "succeeded" else "—"
     return str(int(value))
+
+
+def _leaderboard_score(
+    row: dict,
+    key: str,
+    accuracy_key: str,
+    *,
+    available: bool = True,
+) -> str:
+    if not available:
+        return "N/A; Not evaluated"
+    value = row.get(key)
+    certified = 0 if value is None else int(value)
+    next_rung = next((rung for rung in DEPTH_LADDER if rung > certified), None)
+    if next_rung is None:
+        return f"T={DEPTH_LADDER[-1]}; Certified"
+    accuracy_percent = row.get(accuracy_key)
+    accuracy = (
+        f"Acc {float(accuracy_percent):.4f}%"
+        if accuracy_percent is not None
+        else "Acc unavailable"
+    )
+    return f"T={next_rung}; {accuracy}"
+
 
 def _load_saved_api_key(server: str) -> str | None:
     try:
@@ -356,15 +381,30 @@ def command_leaderboard(args) -> int:
     if not rows:
         print("No submissions yet.")
         return 0
-    print("Hard leaderboard · ranked by Max T, then OOD N Max T")
-    print(f"{'#':>3}  {'max T':>5}  {'OOD N max T':>11}  participant / file")
-    print(f"{'—' * 3}  {'—' * 5}  {'—' * 11}  {'—' * 32}")
+    print(
+        "Hard leaderboard · ranked by Max T, OOD N Max T, "
+        "then unrounded next-rung accuracy"
+    )
+    print(f"{'#':>3}  participant")
+    print(f"{'—' * 3}  {'—' * 32}")
     for rank, row in enumerate(rows, start=1):
+        print(f"{rank:>3}  {row['submitter']}")
         print(
-            f"{rank:>3}  "
-            f"{_max_t(row, 'max_certified_time_steps'):>5}  "
-            f"{_max_t(row, 'ood_n_max_certified_time_steps'):>11}  "
-            f"{row['submitter']} / {row['filename']}"
+            "     In Distribution N progress: "
+            + _leaderboard_score(
+                row,
+                "max_certified_time_steps",
+                "seen_tiebreak_accuracy_percent",
+            )
+        )
+        print(
+            "     Out of Distribution N progress: "
+            + _leaderboard_score(
+                row,
+                "ood_n_max_certified_time_steps",
+                "ood_n_tiebreak_accuracy_percent",
+                available=row.get("ood_n_profile_available") is not False,
+            )
         )
     return 0
 

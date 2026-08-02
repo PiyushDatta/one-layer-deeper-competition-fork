@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import unittest
+from unittest.mock import patch
 
 from service.views import (
     leaderboard_page,
@@ -97,8 +99,16 @@ class SubmissionRulesPageTests(unittest.TestCase):
     def test_beta_notice_invites_feedback_before_rules_are_finalized(self) -> None:
         page = submit_page()
         self.assertIn("Beta:", page)
-        self.assertIn("before we finalize the rules", page)
+        self.assertIn("refine the competition and finalize the rules", page)
         self.assertIn('href="https://discord.gg/gpumode"', page)
+        self.assertIn(
+            "The beta runs from July 31 through Sunday, August 2 at 10:00 PM PT.",
+            page,
+        )
+        self.assertIn(
+            "The competition continues through Monday, August 31 at 10:00 PM PT.",
+            page,
+        )
         self.assertIn("#one-layer-deeper", page)
         self.assertNotIn("issue on GitHub", page)
 
@@ -112,6 +122,8 @@ class SubmissionRulesPageTests(unittest.TestCase):
         self.assertIn("training_time_seconds", page)
         self.assertIn("Training loss", page)
         self.assertIn("training_loss", page)
+        self.assertIn("token_training_loss", page)
+        self.assertIn("TokenLossBatch", page)
         self.assertIn('href="/samples/submission.py"', page)
         self.assertNotIn("recurrent_adamw", page)
         self.assertNotIn("recurrent_lion", page)
@@ -144,7 +156,7 @@ class CompetitionDeadlineTests(unittest.TestCase):
     def test_shared_layout_shows_submission_deadline(self) -> None:
         page = leaderboard_page([])
         self.assertIn(
-            "<strong>Submission deadline:</strong> August 31 at 10:00 PM PT.",
+            "<strong>Submission deadline:</strong> Monday, August 31 at 10:00 PM PT.",
             page,
         )
         self.assertIn('aria-label="Competition submission deadline"', page)
@@ -184,6 +196,9 @@ class CompetitionPrivacyTests(unittest.TestCase):
             "submitter": "Ada Lovelace",
             "max_certified_time_steps": 32,
             "ood_n_max_certified_time_steps": 16,
+            "ood_n_profile_available": True,
+            "seen_tiebreak_accuracy_percent": 82.4321,
+            "ood_n_tiebreak_accuracy_percent": 61.7654,
             # Private fields must never be rendered even if a caller supplies them.
             "name": "secret architecture name",
             "description": "secret architecture description",
@@ -191,20 +206,82 @@ class CompetitionPrivacyTests(unittest.TestCase):
             "error": "secret failure details",
             "log_tail": "secret evaluator logs",
             "result": {"seeds": [{"secret": "private-seed-payload"}]},
+            "seen_tiebreak_accuracy": "private-seen-tiebreak",
+            "ood_n_tiebreak_accuracy": "private-ood-tiebreak",
         }
 
-    def test_leaderboard_shows_identity_file_and_max_t_only(self) -> None:
+    def test_leaderboard_shows_next_target_and_rounded_accuracy(self) -> None:
         page = leaderboard_page([self.row])
         self.assertIn("Ada Lovelace", page)
-        self.assertIn("submission.py", page)
+        self.assertNotIn("submission.py", page)
         self.assertNotIn("<th>Status</th>", page)
         self.assertIn("Max T", page)
         self.assertIn("OOD N Max T", page)
-        self.assertIn('<td class="score">32</td>', page)
-        self.assertIn('<td class="score">16</td>', page)
-        self.assertIn("source and run details remain private", page)
+        self.assertIn("In Distribution N progress", page)
+        self.assertIn("Out of Distribution N progress", page)
+        self.assertNotIn("Familiar N progress", page)
+        self.assertNotIn("New N progress", page)
+        self.assertIn("T=64", page)
+        self.assertIn("Acc 82.4321%", page)
+        self.assertIn("T=32", page)
+        self.assertIn("Acc 61.7654%", page)
+        self.assertNotIn("<th>Dataset</th>", page)
+        self.assertNotIn("H1 · Hidden evaluation", page)
+        self.assertIn("Ranking uses the unrounded accuracies", page)
         self.assertNotIn("secret architecture", page)
         self.assertNotIn("secret-modal-call", page)
+        self.assertNotIn("private-seen-tiebreak", page)
+        self.assertNotIn("private-ood-tiebreak", page)
+
+    def test_leaderboard_handles_completed_and_unavailable_profiles(self) -> None:
+        row = {
+            **self.row,
+            "max_certified_time_steps": 64,
+            "seen_tiebreak_accuracy_percent": None,
+            "ood_n_max_certified_time_steps": None,
+            "ood_n_tiebreak_accuracy_percent": None,
+            "ood_n_profile_available": False,
+        }
+        page = leaderboard_page([row])
+        self.assertIn('<span class="score-value">T=64</span>', page)
+        self.assertIn('<span class="score-progress">Certified</span>', page)
+        self.assertIn('<span class="score-value">N/A</span>', page)
+        self.assertIn('<span class="score-progress">Not evaluated</span>', page)
+
+    def test_leaderboard_api_allows_only_public_fields(self) -> None:
+        from service import app as service_app
+
+        with patch.object(
+            service_app.database,
+            "leaderboard",
+            return_value=[self.row],
+        ):
+            response = service_app.leaderboard_api()
+
+        payload = json.loads(response.body)[0]
+        self.assertEqual(
+            set(payload),
+            {
+                "id",
+                "filename",
+                "status",
+                "created_at",
+                "manifest_name",
+                "tier",
+                "dataset_id",
+                "dataset_label",
+                "finished_at",
+                "submitter",
+                "max_certified_time_steps",
+                "ood_n_max_certified_time_steps",
+                "ood_n_profile_available",
+                "seen_tiebreak_accuracy_percent",
+                "ood_n_tiebreak_accuracy_percent",
+            },
+        )
+        self.assertNotIn("result", payload)
+        self.assertNotIn("seen_tiebreak_accuracy", payload)
+        self.assertNotIn("ood_n_tiebreak_accuracy", payload)
 
     def test_public_submission_page_hides_run_internals(self) -> None:
         page = submission_page(self.row)

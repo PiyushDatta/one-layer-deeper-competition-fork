@@ -6,6 +6,7 @@ from html import escape
 import json
 
 from .competition import (
+    BETA_END_LABEL,
     SUBMISSION_DEADLINE_LABEL,
     SUBMISSIONS_CLOSED_MESSAGE,
 )
@@ -91,7 +92,7 @@ def problem_page() -> str:
         <div class="panel-head"><h2>How it is scored</h2><span>Certified Max T</span></div>
         <div class="problem-card-body">
           <p>An example counts as correct only when every target token is correct. A nearly right residue earns no partial credit for that example.</p>
-          <p>Hard ranks by the largest consecutively certified T on modulus identities seen during training, then by the corresponding Max T on unseen interpolation and extrapolation modulus sizes. Every example in every rung through Max T must be exactly correct.</p>
+          <p>Hard ranks by the largest consecutively certified T on in-distribution modulus identities, then by the corresponding Max T on out-of-distribution modulus sizes. Ties use accuracy at each profile's first uncertified rung. Every example in every rung through Max T must be exactly correct.</p>
           <p><strong>Hard is a hidden task evaluation and may change aspects of the recurrence itself; do not assume it is repeated squaring.</strong></p>
         </div>
       </article>
@@ -118,10 +119,35 @@ def problem_page() -> str:
     return _layout("Problem", content)
 
 
+DEPTH_LADDER = (1, 2, 4, 8, 16, 32, 64)
+
+
 def _max_t_text(value, *, available: bool = True) -> str:
     if not available:
         return "N/A"
-    return "<1" if value is None or int(value) < 1 else str(int(value))
+    if value is None or int(value) < 1:
+        return "None certified"
+    return str(int(value))
+
+
+def _progress_display(
+    value,
+    accuracy_percent,
+    *,
+    available: bool = True,
+) -> tuple[str, str]:
+    if not available:
+        return "N/A", "Not evaluated"
+    certified = 0 if value is None else int(value)
+    next_rung = next((rung for rung in DEPTH_LADDER if rung > certified), None)
+    if next_rung is None:
+        return f"T={DEPTH_LADDER[-1]}", "Certified"
+    accuracy = (
+        f"Acc {float(accuracy_percent):.4f}%"
+        if accuracy_percent is not None
+        else "Acc unavailable"
+    )
+    return f"T={next_rung}", accuracy
 
 
 def leaderboard_page(rows: list[dict]) -> str:
@@ -129,17 +155,24 @@ def leaderboard_page(rows: list[dict]) -> str:
     table_rows = []
     for row in rows:
         rank = ranks.get(str(row["id"]), "—")
-        max_t = _max_t_text(row.get("max_certified_time_steps"))
-        ood_n_max_t = _max_t_text(row.get("ood_n_max_certified_time_steps"))
+        max_t, max_t_accuracy = _progress_display(
+            row.get("max_certified_time_steps"),
+            row.get("seen_tiebreak_accuracy_percent"),
+        )
+        ood_n_max_t, ood_n_max_t_accuracy = _progress_display(
+            row.get("ood_n_max_certified_time_steps"),
+            row.get("ood_n_tiebreak_accuracy_percent"),
+            available=row.get("ood_n_profile_available") is not False,
+        )
         submitter = row["submitter"]
         table_rows.append(
             f"""<tr>
               <td class="rank">{rank}</td>
-              <td><a class="entry" href="/submissions/{row["id"]}">{escape(submitter)}</a>
-                  <span class="muted block">{escape(row["filename"])}</span></td>
-              <td class="score">{escape(max_t)}</td>
-              <td class="score">{escape(ood_n_max_t)}</td>
-              <td class="muted">{escape(str(row.get("dataset_label") or row["manifest_name"]))}</td>
+              <td><a class="entry" href="/submissions/{row["id"]}">{escape(submitter)}</a></td>
+              <td class="score"><span class="score-value">{escape(max_t)}</span>
+                  <span class="score-progress">{escape(max_t_accuracy)}</span></td>
+              <td class="score"><span class="score-value">{escape(ood_n_max_t)}</span>
+                  <span class="score-progress">{escape(ood_n_max_t_accuracy)}</span></td>
             </tr>"""
         )
     empty = "" if table_rows else '<div class="empty">No submissions yet.</div>'
@@ -156,9 +189,9 @@ def leaderboard_page(rows: list[dict]) -> str:
     </section>
     <section class="panel">
       <div class="panel-head"><h2>Leaderboard</h2><span>{len(rows)} ranked</span></div>
-      <div class="notice"><strong>Higher is better.</strong> Max T is the hardest problem depth solved perfectly using familiar number sizes. OOD N Max T is the hardest depth solved perfectly using new number sizes. The leaderboard ranks by Max T first, then OOD N Max T. Each participant appears once with their best successful Hard run; source and run details remain private.</div>
+      <div class="notice"><strong>Higher is better.</strong> Each score cell shows the next T to certify and its accuracy, rounded to four decimal places. Once every example at that T is correct, the target advances from T=1 to 2, 4, 8, 16, 32, then 64. Max T uses in-distribution number sizes; OOD N Max T uses out-of-distribution number sizes. Ranking uses the unrounded accuracies.</div>
       <div class="table-wrap"><table>
-        <thead><tr><th>#</th><th>Participant / file</th><th>Max T</th><th>OOD N Max T</th><th>Dataset</th></tr></thead>
+        <thead><tr><th>#</th><th>Participant</th><th>In Distribution N progress</th><th>Out of Distribution N progress</th></tr></thead>
         <tbody>{"".join(table_rows)}</tbody>
       </table></div>{empty}
     </section>"""
@@ -221,25 +254,14 @@ def submit_page(
     <section class="submit-grid">
       <div><p class="eyebrow">Single-file contract</p><h1>Ship the idea,<br><em>not the pipeline.</em></h1>
       <p class="lede">Upload one <code>submission.py</code>, then choose a practice dataset or the ranked Hard evaluation.</p>
-      <aside class="beta-notice"><strong>Beta:</strong> We're refining the competition and would love your feedback before we finalize the rules in the near future. Share your thoughts in the <a href="https://discord.gg/gpumode">GPU MODE Discord</a> <code>#one-layer-deeper</code> channel.</aside>
+      <aside class="beta-notice"><strong>Beta:</strong> The beta runs from July 31 through {escape(BETA_END_LABEL)}. The competition continues through {escape(SUBMISSION_DEADLINE_LABEL)}. We are using the beta to refine the competition and finalize the rules, so share your feedback in the <a href="https://discord.gg/gpumode">GPU MODE Discord</a> <code>#one-layer-deeper</code> channel.</aside>
       <div class="rules"><span>01</span><p><strong>Artifact:</strong> one UTF-8 file named <code>submission.py</code>, up to 256 KiB. Imports may use the public benchmark API and pinned evaluator dependencies—no extra files, repository implementation modules, or installs.</p>
       <span>02</span><p><strong>Model factory:</strong> receives only tensor shapes, I/O requirements, and the model-state ceiling.</p>
-      <span>03</span><p><strong>Training loss:</strong> optionally turn final logits, auxiliary outputs, and current labels into one scalar loss. The evaluator performs one backward pass.</p>
+      <span>03</span><p><strong>Training loss:</strong> optionally use the legacy flattened callback or a boundary-preserving <code>TokenLossBatch</code> to produce one scalar loss. The evaluator performs one backward pass.</p>
       <span>04</span><p><strong>Optimizer factory:</strong> receives the model, per-seed H100 time allowance, and device type. Include every trainable parameter exactly once; custom optimizers and schedules are welcome.</p>
       <span>05</span><p><strong>Use the whole machine:</strong> optimizer state, activations, memory tokens, and temporary workspace may use available VRAM. An OOM or timeout fails the run; only persistent model state is capped.</p>
-      <span>06</span><p><strong>Evaluator boundary:</strong> choose a training and evaluation batch size and an optional lower step limit; the evaluator still fixes data, sampling, one forward, one backward, clipping, optimizer cadence, deadline, final evaluation, and score. Final evaluation has a separate time budget equal to half the training allowance.</p></div>
-      <section class="submission-rules" aria-labelledby="submission-rules-heading">
-        <h2 id="submission-rules-heading">Rules</h2>
-        <div class="rules">
-          <span>01</span><p><strong>Maximum 500 million trainable parameters.</strong></p>
-          <span>02</span><p><strong>No hard-coded weights.</strong> Trainable weights must use a random initialization and be updated during training. For example, <code>torch.load</code> is not allowed.</p>
-          <span>03</span><p><strong>No hard-coded algorithm in the forward pass.</strong> Outputs must be produced by the learned model.</p>
-          <span>04</span><p><strong>End-to-end learning only.</strong> Final logits must be produced entirely by the submitted model from its inputs and learned PyTorch state, with all input-dependent computation inside the autograd graph and an unbroken gradient path from the loss to the parameters responsible for the prediction.</p>
-          <span>05</span><p><strong>Everything stays on the GPU.</strong> Model state and computation must remain on the GPU throughout training and evaluation; CPU offloading is not allowed.</p>
-          <span>06</span><p><strong>Repeated rule-breaking will get you banned.</strong> We still encourage creativity: discussing possible loopholes on Discord or testing one in a submission won't get you banned.</p>
-          <span>07</span><p><strong>The metric recorder for a Hard run must not be exploited.</strong> Any attempt to exploit it will result in an immediate ban.</p>
-        </div>
-      </section></div>
+      <span>06</span><p><strong>Evaluator boundary:</strong> choose a training and evaluation batch size and an optional lower step limit; the evaluator still fixes data, sampling, its outer loop (one model forward and evaluator-owned backward per sampled batch), clipping, optimizer cadence, deadline, final evaluation, and score. That outer-loop boundary does not restrict internal model, loss, or optimizer computation: recurrent/iterative mechanisms, TRMs, and optimizer-side curvature or Hessian approximations are allowed. Final evaluation has a separate time budget equal to half the training allowance.</p></div>
+      </div>
       <form class="{upload_card_class}" action="/submit" method="post" enctype="multipart/form-data">
         <div><span class="file-kicker">PY</span><h2>Upload submission.py</h2><p>One self-contained Python file, up to 256 KiB.</p></div>
         {error_html}
@@ -251,6 +273,18 @@ def submit_page(
         <button class="button" type="submit"{control_disabled}>{submit_label}</button>
         <p class="form-note">No key yet? <a href="/register">Sign in with GitHub</a>. CLI users run <code>one-layer login</code> once; submissions must pass <code>--tier</code> and, for Easy or Medium, <code>--dataset</code>. Only the best successful Hard score per participant is ranked.</p>
       </form>
+      <section class="submission-rules" aria-labelledby="submission-rules-heading">
+        <h2 id="submission-rules-heading">Rules</h2>
+        <div class="rules">
+          <span>01</span><p><strong>Maximum 500 million trainable parameters.</strong></p>
+          <span>02</span><p><strong>No hard-coded weights.</strong> Trainable weights must use a random initialization and be updated during training. For example, <code>torch.load</code> is not allowed.</p>
+          <span>03</span><p><strong>No hard-coded algorithm in the forward pass.</strong> Outputs must be produced by the learned model.</p>
+          <span>04</span><p><strong>End-to-end learning only.</strong> Final logits must be produced entirely by the submitted model from its inputs and learned PyTorch state, with all input-dependent computation inside the autograd graph and an unbroken gradient path from the loss to the parameters responsible for the prediction.</p>
+          <span>05</span><p><strong>Everything stays on the GPU.</strong> Model state and computation must remain on the GPU throughout training and evaluation; CPU offloading is not allowed.</p>
+          <span>06</span><p><strong>Repeated rule-breaking will get you banned.</strong> We still encourage creativity: discussing possible loopholes on Discord or testing one in a submission won't get you banned.</p>
+          <span>07</span><p><strong>The metric recorder for a Hard run must not be exploited.</strong> Any attempt to exploit it will result in an immediate ban.</p>
+        </div>
+      </section>
       <script>
       (() => {{
         const catalog = {dataset_catalog};
@@ -274,7 +308,7 @@ def submit_page(
       </script>
     </section>
     <section class="contract panel"><div class="panel-head"><h2>Contract sketch</h2><a href="/samples/submission.py">Download sample</a></div>
-<pre><code>from benchmark import ModelSpec, OptimizerSpec, OptimizerBundle, Submission, assert_model_state
+<pre><code>from benchmark import ModelSpec, OptimizerSpec, OptimizerBundle, Submission, TokenLossBatch, assert_model_state
 
 def build_model(spec: ModelSpec):
     model = MyModel(spec)
@@ -286,13 +320,13 @@ def build_optimizer(model, spec: OptimizerSpec):
     scheduler = MySchedule(optimizer, spec.training_time_seconds)
     return OptimizerBundle(optimizer, scheduler=scheduler)
 
-def training_loss(logits, labels, auxiliary):
-    return my_loss(logits, labels, auxiliary)
+def token_training_loss(batch: TokenLossBatch):
+    return my_sequence_loss(batch.logits, batch.labels, batch.valid_mask)
 
 SUBMISSION = Submission(
     build_model=build_model,
     build_optimizer=build_optimizer,
-    training_loss=training_loss,  # optional
+    token_training_loss=token_training_loss,  # optional
     batch_size=512,  # optional; training
     eval_batch_size=1024,  # optional; evaluation
     max_steps=20_000,  # optional

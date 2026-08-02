@@ -3,7 +3,9 @@ An architecture-and-optimizer competition from **Core Automation × Tilde Resear
 
 Build the best function-composition model under a fixed persistent-state ceiling and H100 training-time budget. Participants control architecture, depth, optimizer, learning-rate schedule, and training loss. The evaluator controls data, the outer loop, and final evaluation.
 
-> **Submission deadline:** August 31 at 10:00 PM PT. The service will not accept submissions after this time.
+> **Beta period:** July 31 through Sunday, August 2 at 10:00 PM PT.
+>
+> **Submission deadline:** Monday, August 31 at 10:00 PM PT. The service will not accept submissions after this time.
 
 For competition updates, join [discord.gg/gpumode](https://discord.gg/gpumode) and follow the `#one-layer-deeper` channel.
 
@@ -41,7 +43,7 @@ python -m unittest discover -s tests
 1. Submit exactly one UTF-8 file named `submission.py`. It exports one `benchmark.Submission` with model and optimizer factories and an optional training loss.
 2. The submission must be self-contained. It may import the public `benchmark` API and pinned evaluator dependencies, but it may not depend on repository `model` or `optim` modules, extra files, package installation, or external services.
 3. Participant code defines the model, optimizer bundle, optional learning-rate scheduler, optional loss, training and evaluation batch sizes, and maximum training steps. Recurrence, adaptive computation, and depth curricula are allowed.
-4. The evaluator fixes data, sampling, the one-forward/one-backward loop, gradient clipping, optimizer cadence, seeds, deadline, final evaluation, and aggregation. Participants may choose the training and evaluation batch size and a lower maximum step count; evaluator ceilings still apply.
+4. The evaluator fixes data, sampling, its outer loop (one model forward and one evaluator-owned backward per sampled batch), gradient clipping, optimizer cadence, seeds, deadline, final evaluation, and aggregation. This does not restrict computation within a submitted model, loss, or optimizer: recurrent/iterative mechanisms, TRMs, and optimizer-side curvature or Hessian approximations are allowed. Participants may choose the training and evaluation batch size and a lower maximum step count; evaluator ceilings still apply.
 5. The model may contain at most 500,000,000 trainable parameters. Shared state counts once; persistent buffers and frozen state still count toward the model-state ceiling.
 6. No hard-coded weights. Trainable weights must use a random initialization and be updated during training. For example, `torch.load` is not allowed.
 7. No hard-coded algorithm in the forward pass. Outputs must be produced by the learned model.
@@ -49,9 +51,9 @@ python -m unittest discover -s tests
 9. Everything stays on the GPU. Model state and computation must remain on the GPU throughout training and evaluation; CPU offloading is not allowed.
 10. Optimizer state, activations, and temporary workspace may use remaining VRAM. OOM or timeout fails the run.
 11. Easy provides 60 H100 training seconds, Medium 600 seconds, and Hard 3,600 seconds. Model construction, submission import, and compilation consume the budget.
-12. A custom training loss receives final logits, labels, and the model's auxiliary output and returns one differentiable finite scalar. The evaluator performs backward.
-13. Each final checkpoint is evaluated once with a separate time budget equal to half its training allowance. Easy and Medium score mean exact accuracy. Hard ranks by the largest consecutively certified T on fresh prompts using modulus identities seen during training, then breaks ties by the largest consecutively certified T on unseen modulus identities. Both use T=1,2,4,8,16,32,64; every example in a rung must be exactly correct, and certification must form a consecutive prefix.
-14. Data inspection, task-specific solvers, custom training loops, participant-controlled backward passes, and manifest overrides are not allowed.
+12. Token tasks may use legacy `training_loss`, which receives flattened valid logits and labels plus the model's auxiliary output, or `token_training_loss`, which receives a boundary-preserving `TokenLossBatch`. A custom loss returns one differentiable finite scalar; the evaluator performs backward.
+13. Each final checkpoint is evaluated once with a separate time budget equal to half its training allowance. Easy and Medium score mean exact accuracy. Hard ranks by the largest consecutively certified T on fresh prompts using modulus identities seen during training, then by the largest consecutively certified T on unseen modulus identities, then by accuracy at each profile's first uncertified rung. Both use T=1,2,4,8,16,32,64; every example in a rung must be exactly correct, and certification must form a consecutive prefix.
+14. Data inspection, data augmentation, task-specific solvers, custom training loops, participant-controlled backward passes, and manifest overrides are not allowed.
 15. Repeated rule-breaking will get you banned. We still encourage creativity: discussing possible loopholes on Discord or testing one in a submission won't get you banned.
 16. The metric recorder for a Hard run must not be exploited. Any attempt to exploit it will result in an immediate ban.
 
@@ -93,6 +95,40 @@ early. The evaluator's wall-clock deadline and absolute step ceiling always rema
 enforced. An optional scheduler returned in `OptimizerBundle` is stepped after
 every completed optimizer update.
 
+Token tasks offer two mutually exclusive custom-loss callbacks. The legacy
+`training_loss(logits, labels, auxiliary)` receives only valid tokens flattened
+to `[valid_tokens, vocab_size]` and `[valid_tokens]`. For sequence-aware
+losses, `token_training_loss(batch)` receives a `TokenLossBatch` whose
+`logits`, `labels`, and boolean `valid_mask` retain
+`[batch, target_length, ...]` boundaries. Its `target_positions` is present
+for separate-output tasks and `None` for causal targets; invalid slots must be
+ignored using `valid_mask`.
+
+```python
+import torch.nn.functional as F
+from benchmark import TokenLossBatch
+
+def token_training_loss(batch: TokenLossBatch):
+    token_losses = F.cross_entropy(
+        batch.logits.transpose(1, 2),
+        batch.labels,
+        ignore_index=-100,
+        reduction="none",
+    )
+    target_counts = batch.valid_mask.sum(dim=1)
+    sequence_losses = (
+        (token_losses * batch.valid_mask).sum(dim=1)
+        / target_counts.clamp_min(1)
+    )
+    return sequence_losses[target_counts > 0].mean()
+
+SUBMISSION = Submission(
+    build_model=build_model,
+    build_optimizer=build_optimizer,
+    token_training_loss=token_training_loss,
+)
+```
+
 The website offers one basic, non-recurrent Transformer using `torch.optim.AdamW`. Its standalone `submission.py` lives under `submissions/baseline_adamw`.
 
 ### Compute tiers
@@ -110,9 +146,9 @@ Easy and Medium are practice tiers. The public leaderboard ranks only each parti
 
 Easy and Medium expose the same `Max T` and `OOD N Max T` fields as Hard, using the common T=1,2,4,8,16,32,64 ladder. Each profile remains specific to its dataset: Max T evaluates modulus identities used by the training dataset, while OOD N Max T evaluates unseen identities at nearby dataset-scale modulus sizes. These practice-tier profiles are diagnostic and do not change their exact-accuracy scores.
 
-Hard leaderboard rows report two certified depth values over private hidden profiles. **Max T** measures familiar problem families, while **OOD N Max T** measures held-out problem families. The evaluator details and data remain private.
+Hard ranking uses two certified depth values over private hidden profiles. **Max T** measures in-distribution problem families, while **OOD N Max T** measures out-of-distribution problem families. The evaluator details and data remain private.
 
-A value is the largest T for which that rung and every lower rung have 100% exact-example accuracy. The leaderboard ranks by Max T, then OOD N Max T, then earlier submission time. Exact-accuracy measurements and individual rung results remain private diagnostics and do not affect Hard ranking.
+A value is the largest T for which that rung and every lower rung have 100% exact-example accuracy. The leaderboard ranks by Max T, then OOD N Max T, then exact accuracy at the first uncertified rung in each profile. Earlier submission time is the final fallback. The public leaderboard shows each next-rung accuracy rounded to four decimal places while ranking uses the unrounded value. All other per-seed measurements and rung results remain private diagnostics.
 
 ## CLI
 

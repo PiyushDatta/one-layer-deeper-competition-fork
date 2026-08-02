@@ -25,7 +25,13 @@ from data import (
     infer_vocab_size,
     make_dataloaders,
 )
-from .api import ModelSpec, OptimizerBundle, OptimizerSpec, Submission
+from .api import (
+    ModelSpec,
+    OptimizerBundle,
+    OptimizerSpec,
+    Submission,
+    TokenLossBatch,
+)
 from .batches import prepare_batch
 from .manifest import BenchmarkManifest, load_manifest
 from .metrics import MetricRecorder
@@ -213,6 +219,7 @@ def _loss_and_accuracy(
     device: torch.device,
     *,
     training_loss=None,
+    token_training_loss=None,
 ) -> tuple[torch.Tensor, float, int, int]:
     input_ids, targets, attention_mask, target_positions = prepare_batch(
         batch,
@@ -261,12 +268,23 @@ def _loss_and_accuracy(
         valid = token_targets != -100
         if not valid.any().item():
             raise ValueError("batch contains no valid language-model targets")
-        loss_logits = token_logits[valid]
-        loss_labels = token_targets[valid]
-        if training_loss is None:
-            loss = F.cross_entropy(loss_logits, loss_labels)
+        if token_training_loss is not None:
+            loss = token_training_loss(
+                TokenLossBatch(
+                    logits=token_logits,
+                    labels=token_targets,
+                    valid_mask=valid,
+                    target_positions=target_positions,
+                    auxiliary=auxiliary,
+                )
+            )
         else:
-            loss = training_loss(loss_logits, loss_labels, auxiliary)
+            loss_logits = token_logits[valid]
+            loss_labels = token_targets[valid]
+            if training_loss is None:
+                loss = F.cross_entropy(loss_logits, loss_labels)
+            else:
+                loss = training_loss(loss_logits, loss_labels, auxiliary)
 
         token_predictions = token_logits.argmax(dim=-1)
         rows_with_targets = valid.any(dim=1)
@@ -280,7 +298,9 @@ def _loss_and_accuracy(
             raise TypeError("training_loss must return one scalar tensor")
         if loss.device != device:
             raise ValueError(f"training_loss must return a tensor on {device}")
-        if training_loss is not None and not loss.requires_grad:
+        if (
+            training_loss is not None or token_training_loss is not None
+        ) and not loss.requires_grad:
             raise ValueError("training_loss result must be differentiable")
 
     exact_accuracy = exact_rows.float().mean().item()
@@ -301,6 +321,7 @@ def _train(
     budget_seconds: float,
     max_steps: int,
     seed: int,
+    token_training_loss=None,
     metric_recorder: MetricRecorder | None = None,
 ) -> tuple[float | None, int, float, int]:
     optimizer = bundle.optimizer
@@ -325,6 +346,7 @@ def _train(
             manifest,
             device,
             training_loss=training_loss,
+            token_training_loss=token_training_loss,
         )
         if not torch.isfinite(loss).all().item():
             raise FloatingPointError(f"non-finite training loss at step {step}")
@@ -568,6 +590,7 @@ def _run_seed(
         raw_model=model,
         train_model=train_model,
         training_loss=submission.training_loss,
+        token_training_loss=submission.token_training_loss,
         bundle=bundle,
         dataloader=dataloaders["train"],
         manifest=manifest,

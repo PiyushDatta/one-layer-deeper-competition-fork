@@ -145,6 +145,27 @@ def _participant_submission_payload(row: dict) -> dict:
     return payload
 
 
+def _public_leaderboard_payload(row: dict) -> dict:
+    fields = (
+        "id",
+        "filename",
+        "status",
+        "created_at",
+        "manifest_name",
+        "tier",
+        "dataset_id",
+        "dataset_label",
+        "finished_at",
+        "submitter",
+        "max_certified_time_steps",
+        "ood_n_max_certified_time_steps",
+        "ood_n_profile_available",
+        "seen_tiebreak_accuracy_percent",
+        "ood_n_tiebreak_accuracy_percent",
+    )
+    return {field: row.get(field) for field in fields}
+
+
 async def _read_submission(file: UploadFile) -> tuple[str, str]:
     raw = await file.read(settings.max_submission_bytes + 1)
     try:
@@ -417,7 +438,8 @@ def sample_submission():
 
 @app.get("/api/leaderboard")
 def leaderboard_api():
-    return JSONResponse(jsonable_encoder(database.leaderboard()))
+    rows = [_public_leaderboard_payload(row) for row in database.leaderboard()]
+    return JSONResponse(jsonable_encoder(rows))
 
 
 @app.get("/api/submissions/{submission_id}")

@@ -166,12 +166,45 @@ class TierDatabaseTests(unittest.TestCase):
         query = connection.queries[0][0]
         self.assertIn("r.tier = 'hard'", query)
         self.assertIn("r.status = 'succeeded'", query)
-        self.assertIn("PARTITION BY u.id", query)
+        self.assertIn("PARTITION BY user_id", query)
         self.assertIn("participant_rank = 1", query)
         self.assertIn("max_certified_time_steps", query)
         self.assertIn("ood_n_max_certified_time_steps", query)
         self.assertIn("COALESCE(max_certified_time_steps, 0) DESC", query)
         self.assertIn("COALESCE(ood_n_max_certified_time_steps, 0) DESC", query)
+        self.assertIn("seen_tiebreak_accuracy DESC", query)
+        self.assertIn("ood_n_tiebreak_accuracy DESC", query)
+        self.assertIn("{depth_profile,rungs}", query)
+        self.assertIn("{depth_profile,ood_n_rungs}", query)
+        self.assertIn("{depth_profile,ladder}", query)
+        self.assertIn("{depth_profile,ood_n_ladder}", query)
+        self.assertIn("AS seen_tiebreak_accuracy_available", query)
+        self.assertIn("AS ood_n_tiebreak_accuracy_available", query)
+        self.assertEqual(
+            query.count("rung.result ->> 'exact_accuracy' IS NOT NULL"),
+            2,
+        )
+        self.assertIn("OR NOT seen_tiebreak_accuracy_available", query)
+        self.assertIn("OR NOT ood_n_tiebreak_accuracy_available", query)
+        self.assertIn("AS seen_tiebreak_accuracy_percent", query)
+        self.assertIn("AS ood_n_tiebreak_accuracy_percent", query)
+        self.assertIn("(seen_tiebreak_accuracy * 100)::numeric", query)
+        self.assertIn("(ood_n_tiebreak_accuracy * 100)::numeric", query)
+        self.assertEqual(query.count(", 4 )::double precision"), 2)
+        self.assertEqual(query.count("seen_tiebreak_accuracy DESC"), 2)
+        self.assertEqual(query.count("ood_n_tiebreak_accuracy DESC"), 2)
+        self.assertEqual(
+            query.count(
+                "seen_tiebreak_accuracy DESC, "
+                "ood_n_tiebreak_accuracy DESC, created_at, id"
+            ),
+            2,
+        )
+        self.assertLess(
+            query.index("seen_tiebreak_accuracy DESC"),
+            query.index("ood_n_tiebreak_accuracy DESC"),
+        )
+
 
 
 if __name__ == "__main__":

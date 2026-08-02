@@ -12,6 +12,7 @@ from benchmark import (
     ModelSpec,
     OptimizerSpec,
     Submission,
+    TokenLossBatch,
     assert_model_state,
     count_model_state_elements,
 )
@@ -150,6 +151,37 @@ class ContractTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "training_loss must be callable"):
             validate_submission(submission)
 
+    def test_optional_token_training_loss_validation(self) -> None:
+        callback = lambda batch: batch.logits.sum()
+        submission = Submission(
+            build_model=lambda spec: None,
+            build_optimizer=lambda model, spec: None,
+            token_training_loss=callback,
+        )
+        validate_submission(submission)
+        self.assertIs(submission.token_training_loss, callback)
+        self.assertIn("valid_mask", TokenLossBatch.__dataclass_fields__)
+
+        invalid = Submission(
+            build_model=lambda spec: None,
+            build_optimizer=lambda model, spec: None,
+            token_training_loss=object(),
+        )
+        with self.assertRaisesRegex(
+            TypeError, "token_training_loss must be callable"
+        ):
+            validate_submission(invalid)
+
+        with self.assertRaisesRegex(ValueError, "cannot define both"):
+            validate_submission(
+                Submission(
+                    build_model=lambda spec: None,
+                    build_optimizer=lambda model, spec: None,
+                    training_loss=callback,
+                    token_training_loss=callback,
+                )
+            )
+
     def test_optional_training_controls_must_be_positive_integers(self) -> None:
         valid = Submission(
             build_model=lambda spec: None,
@@ -189,6 +221,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(submission.batch_size, 128)
         self.assertEqual(submission.max_steps, 500)
         self.assertIsNone(submission.eval_batch_size)
+        self.assertIsNone(submission.token_training_loss)
 
     def test_removed_packages_and_harness_are_absent(self) -> None:
         self.assertFalse((ROOT / "model").exists())

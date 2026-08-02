@@ -82,6 +82,21 @@ class OptimizerBundle:
 
 
 @dataclass(frozen=True)
+class TokenLossBatch:
+    """Boundary-preserving inputs for a participant-defined token loss.
+
+    Invalid target slots remain padded. ``valid_mask`` is authoritative and
+    must be used to exclude their labels, logits, and target positions.
+    """
+
+    logits: torch.Tensor
+    labels: torch.Tensor
+    valid_mask: torch.Tensor
+    target_positions: torch.Tensor | None
+    auxiliary: object
+
+
+@dataclass(frozen=True)
 class Submission:
     """Participant-controlled components exported as ``SUBMISSION``."""
 
@@ -93,3 +108,4 @@ class Submission:
     batch_size: int | None = None
     max_steps: int | None = None
     eval_batch_size: int | None = None
+    token_training_loss: Callable[[TokenLossBatch], torch.Tensor] | None = None

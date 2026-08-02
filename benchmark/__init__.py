@@ -5,6 +5,7 @@ from .api import (
     OptimizerBundle,
     OptimizerSpec,
     Submission,
+    TokenLossBatch,
     assert_model_state,
     count_model_state_elements,
 )
@@ -14,6 +15,7 @@ __all__ = [
     "OptimizerBundle",
     "OptimizerSpec",
     "Submission",
+    "TokenLossBatch",
     "assert_model_state",
     "count_model_state_elements",
 ]

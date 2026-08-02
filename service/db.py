@@ -584,36 +584,194 @@ class Database:
             return list(
                 connection.execute(
                     """
-                    WITH ranked AS (
+                    WITH base AS (
                         SELECT
                             s.id, s.filename, r.status, s.created_at,
                             r.manifest_name, r.tier, r.dataset_id,
                             r.dataset_label, r.finished_at,
                             u.id AS user_id, u.display_name AS submitter,
+                            r.result,
                             (r.result -> 'depth_profile' ->> 'max_certified_time_steps')::integer AS max_certified_time_steps,
                             (r.result -> 'depth_profile' ->> 'ood_n_max_certified_time_steps')::integer AS ood_n_max_certified_time_steps,
-                            COALESCE((r.result -> 'depth_profile' ->> 'ood_n_profile_available')::boolean, false) AS ood_n_profile_available,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY u.id
-                                ORDER BY
-                                    COALESCE((r.result -> 'depth_profile' ->> 'max_certified_time_steps')::integer, 0) DESC,
-                                    COALESCE((r.result -> 'depth_profile' ->> 'ood_n_max_certified_time_steps')::integer, 0) DESC,
-                                    s.created_at,
-                                    s.id
-                            ) AS participant_rank
+                            COALESCE((r.result -> 'depth_profile' ->> 'ood_n_profile_available')::boolean, false) AS ood_n_profile_available
                         FROM submissions s
                         JOIN runs r ON r.submission_id = s.id
                         JOIN users u ON u.id = s.user_id
-                        WHERE r.tier = 'hard' AND r.status = 'succeeded'
+                        WHERE r.tier = 'hard'
+                          AND r.status = 'succeeded'
+                    ), scored AS (
+                        SELECT
+                            base.*,
+                            COALESCE((
+                                SELECT
+                                    MIN(
+                                        COALESCE((
+                                            SELECT
+                                                (rung.result ->> 'correct_examples')::double precision
+                                                / NULLIF(
+                                                    (rung.result ->> 'example_count')::double precision,
+                                                    0
+                                                )
+                                            FROM jsonb_array_elements(
+                                                seed.result #> '{depth_profile,rungs}'
+                                            ) AS rung(result)
+                                            WHERE (rung.result ->> 'time_steps')::integer = (
+                                                SELECT MIN(time_steps::integer)
+                                                FROM jsonb_array_elements_text(
+                                                    base.result #> '{depth_profile,ladder}'
+                                                ) AS ladder(time_steps)
+                                                WHERE time_steps::integer
+                                                    > COALESCE(base.max_certified_time_steps, 0)
+                                            )
+                                            LIMIT 1
+                                        ), 0.0)
+                                    )
+                                FROM jsonb_array_elements(base.result -> 'seeds') AS seed(result)
+                            ), 0.0) AS seen_tiebreak_accuracy,
+                            COALESCE((
+                                SELECT
+                                    MIN(
+                                        COALESCE((
+                                            SELECT
+                                                (rung.result ->> 'correct_examples')::double precision
+                                                / NULLIF(
+                                                    (rung.result ->> 'example_count')::double precision,
+                                                    0
+                                                )
+                                            FROM jsonb_array_elements(
+                                                seed.result #> '{depth_profile,ood_n_rungs}'
+                                            ) AS rung(result)
+                                            WHERE (rung.result ->> 'time_steps')::integer = (
+                                                SELECT MIN(time_steps::integer)
+                                                FROM jsonb_array_elements_text(
+                                                    base.result #> '{depth_profile,ood_n_ladder}'
+                                                ) AS ladder(time_steps)
+                                                WHERE time_steps::integer
+                                                    > COALESCE(
+                                                        base.ood_n_max_certified_time_steps,
+                                                        0
+                                                    )
+                                            )
+                                            LIMIT 1
+                                        ), 0.0)
+                                    )
+                                FROM jsonb_array_elements(base.result -> 'seeds') AS seed(result)
+                            ), 0.0) AS ood_n_tiebreak_accuracy,
+                            COALESCE((
+                                SELECT BOOL_AND(
+                                    measurement.accuracy IS NOT NULL
+                                )
+                                FROM (
+                                    SELECT (
+                                        SELECT
+                                            (rung.result ->> 'correct_examples')::double precision
+                                            / NULLIF(
+                                                (rung.result ->> 'example_count')::double precision,
+                                                0
+                                            )
+                                        FROM jsonb_array_elements(
+                                            seed.result #> '{depth_profile,rungs}'
+                                        ) AS rung(result)
+                                        WHERE (rung.result ->> 'time_steps')::integer = (
+                                            SELECT MIN(time_steps::integer)
+                                            FROM jsonb_array_elements_text(
+                                                base.result #> '{depth_profile,ladder}'
+                                            ) AS ladder(time_steps)
+                                            WHERE time_steps::integer
+                                                > COALESCE(
+                                                    base.max_certified_time_steps,
+                                                    0
+                                                )
+                                        )
+                                          AND rung.result ->> 'exact_accuracy'
+                                              IS NOT NULL
+                                        LIMIT 1
+                                    ) AS accuracy
+                                    FROM jsonb_array_elements(
+                                        base.result -> 'seeds'
+                                    ) AS seed(result)
+                                ) AS measurement
+                            ), false) AS seen_tiebreak_accuracy_available,
+                            COALESCE((
+                                SELECT BOOL_AND(
+                                    measurement.accuracy IS NOT NULL
+                                )
+                                FROM (
+                                    SELECT (
+                                        SELECT
+                                            (rung.result ->> 'correct_examples')::double precision
+                                            / NULLIF(
+                                                (rung.result ->> 'example_count')::double precision,
+                                                0
+                                            )
+                                        FROM jsonb_array_elements(
+                                            seed.result #> '{depth_profile,ood_n_rungs}'
+                                        ) AS rung(result)
+                                        WHERE (rung.result ->> 'time_steps')::integer = (
+                                            SELECT MIN(time_steps::integer)
+                                            FROM jsonb_array_elements_text(
+                                                base.result #> '{depth_profile,ood_n_ladder}'
+                                            ) AS ladder(time_steps)
+                                            WHERE time_steps::integer
+                                                > COALESCE(
+                                                    base.ood_n_max_certified_time_steps,
+                                                    0
+                                                )
+                                        )
+                                          AND rung.result ->> 'exact_accuracy'
+                                              IS NOT NULL
+                                        LIMIT 1
+                                    ) AS accuracy
+                                    FROM jsonb_array_elements(
+                                        base.result -> 'seeds'
+                                    ) AS seed(result)
+                                ) AS measurement
+                            ), false) AS ood_n_tiebreak_accuracy_available
+                        FROM base
+                    ), ranked AS (
+                        SELECT
+                            scored.*,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY user_id
+                                ORDER BY
+                                    COALESCE(max_certified_time_steps, 0) DESC,
+                                    COALESCE(ood_n_max_certified_time_steps, 0) DESC,
+                                    seen_tiebreak_accuracy DESC,
+                                    ood_n_tiebreak_accuracy DESC,
+                                    created_at,
+                                    id
+                            ) AS participant_rank
+                        FROM scored
                     )
                     SELECT id, filename, status, created_at, manifest_name,
                            tier, dataset_id, dataset_label, finished_at,
                            submitter, max_certified_time_steps,
-                           ood_n_max_certified_time_steps, ood_n_profile_available
+                           ood_n_max_certified_time_steps, ood_n_profile_available,
+                           CASE
+                               WHEN COALESCE(max_certified_time_steps, 0) >= 64
+                                   OR NOT seen_tiebreak_accuracy_available
+                                   THEN NULL
+                               ELSE ROUND(
+                                   (seen_tiebreak_accuracy * 100)::numeric,
+                                   4
+                               )::double precision
+                           END AS seen_tiebreak_accuracy_percent,
+                           CASE
+                               WHEN NOT ood_n_profile_available
+                                   OR COALESCE(ood_n_max_certified_time_steps, 0) >= 64
+                                   OR NOT ood_n_tiebreak_accuracy_available
+                                   THEN NULL
+                               ELSE ROUND(
+                                   (ood_n_tiebreak_accuracy * 100)::numeric,
+                                   4
+                               )::double precision
+                           END AS ood_n_tiebreak_accuracy_percent
                     FROM ranked
                     WHERE participant_rank = 1
                     ORDER BY COALESCE(max_certified_time_steps, 0) DESC,
                              COALESCE(ood_n_max_certified_time_steps, 0) DESC,
+                             seen_tiebreak_accuracy DESC,
+                             ood_n_tiebreak_accuracy DESC,
                              created_at, id
                     """
                 ).fetchall()
