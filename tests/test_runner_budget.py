@@ -356,6 +356,154 @@ class RunnerBudgetTests(unittest.TestCase):
             ["certified", "failed", "passed_uncertified", "passed_uncertified"],
         )
 
+    def test_multi_pass_updates_and_bounded_batch_reuse(self) -> None:
+        class CountingSGD(torch.optim.SGD):
+            def __init__(self, params):
+                super().__init__(params, lr=0.0)
+                self.step_calls = 0
+
+            def step(self, closure=None):
+                self.step_calls += 1
+                return super().step(closure)
+
+        model = torch.nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            model.weight.fill_(1.0)
+        optimizer = CountingSGD(model.parameters())
+        scheduler_steps = []
+        between_calls = []
+        reuse_calls = []
+        seen_batches = []
+
+        def between_backward_passes(context):
+            self.assertFalse(torch.is_grad_enabled())
+            between_calls.append(context)
+
+        def should_reuse_batch(context):
+            self.assertFalse(torch.is_grad_enabled())
+            reuse_calls.append(context)
+            return True
+
+        bundle = OptimizerBundle(
+            optimizer,
+            scheduler=SimpleNamespace(step=lambda: scheduler_steps.append(True)),
+            backward_passes_per_step=2,
+            between_backward_passes=between_backward_passes,
+            should_reuse_batch=should_reuse_batch,
+        )
+        manifest = SimpleNamespace(
+            runtime=SimpleNamespace(grad_clip=None, log_every=100),
+            model_state=object(),
+        )
+
+        def loss_and_accuracy(model, batch, *args, **kwargs):
+            seen_batches.append(float(batch.item()))
+            return model.weight.sum() * batch, float(batch.item()), 1, 1
+
+        with (
+            patch("benchmark.runner._loss_and_accuracy", side_effect=loss_and_accuracy),
+            patch("benchmark.runner.validate_model_state"),
+            patch("benchmark.runner.time.monotonic", return_value=1.0),
+            patch("benchmark.runner.MAX_OPTIMIZER_STEPS_PER_BATCH", 3),
+        ):
+            _, completed_steps, _, _ = _train(
+                raw_model=model,
+                train_model=model,
+                training_loss=None,
+                bundle=bundle,
+                dataloader=[torch.tensor(1.0), torch.tensor(2.0)],
+                manifest=manifest,
+                device=torch.device("cpu"),
+                started_at=0.0,
+                deadline=2.0,
+                budget_seconds=2.0,
+                max_steps=5,
+                seed=74,
+            )
+
+        self.assertEqual(completed_steps, 5)
+        self.assertEqual(optimizer.step_calls, 5)
+        self.assertEqual(len(scheduler_steps), 5)
+        self.assertEqual(seen_batches, [1.0] * 6 + [2.0] * 4)
+        self.assertEqual(
+            [context.completed_steps for context in between_calls],
+            [0, 1, 2, 3, 4],
+        )
+        self.assertTrue(
+            all(
+                context.pass_index == 1 and context.total_passes == 2
+                for context in between_calls
+            )
+        )
+        self.assertEqual(
+            [context.current_batch_uses for context in reuse_calls],
+            [1, 2, 1, 2],
+        )
+        self.assertEqual(
+            [context.completed_steps for context in reuse_calls],
+            [1, 2, 4, 5],
+        )
+        self.assertEqual(
+            [context.loss for context in reuse_calls], [1.0, 1.0, 2.0, 2.0]
+        )
+        self.assertTrue(all(type(context.loss) is float for context in reuse_calls))
+
+
+    def test_multi_pass_and_reuse_callback_validation_at_runtime(self) -> None:
+        model = torch.nn.Linear(1, 1)
+        manifest = SimpleNamespace(
+            runtime=SimpleNamespace(grad_clip=None, log_every=1),
+            model_state=object(),
+        )
+        too_many = OptimizerBundle(
+            torch.optim.SGD(model.parameters(), lr=0.0),
+            backward_passes_per_step=9,
+        )
+        with self.assertRaisesRegex(ValueError, "maximum of 8"):
+            _train(
+                raw_model=model,
+                train_model=model,
+                training_loss=None,
+                bundle=too_many,
+                dataloader=[object()],
+                manifest=manifest,
+                device=torch.device("cpu"),
+                started_at=0.0,
+                deadline=2.0,
+                budget_seconds=2.0,
+                max_steps=1,
+                seed=74,
+            )
+
+        invalid_reuse = OptimizerBundle(
+            torch.optim.SGD(model.parameters(), lr=0.0),
+            should_reuse_batch=lambda context: 1,
+        )
+
+        def loss_and_accuracy(*args, **kwargs):
+            return model.weight.sum(), 0.0, 1, 1
+
+        with (
+            patch("benchmark.runner._loss_and_accuracy", side_effect=loss_and_accuracy),
+            patch("benchmark.runner.validate_model_state"),
+            patch("benchmark.runner.time.monotonic", return_value=1.0),
+            self.assertRaisesRegex(TypeError, "must return bool"),
+        ):
+            _train(
+                raw_model=model,
+                train_model=model,
+                training_loss=None,
+                bundle=invalid_reuse,
+                dataloader=[object()],
+                manifest=manifest,
+                device=torch.device("cpu"),
+                started_at=0.0,
+                deadline=2.0,
+                budget_seconds=2.0,
+                max_steps=1,
+                seed=74,
+            )
+
     def test_dataset_files_cannot_be_reopened_after_preload(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             dataset = Path(directory) / "test.jsonl"

@@ -26,6 +26,8 @@ from data import (
     make_dataloaders,
 )
 from .api import (
+    BackwardPassContext,
+    BatchReuseContext,
     ModelSpec,
     OptimizerBundle,
     OptimizerSpec,
@@ -46,6 +48,8 @@ from .validation import (
 
 
 EVALUATION_TIME_FRACTION = 0.5
+MAX_BACKWARD_PASSES_PER_STEP = 8
+MAX_OPTIMIZER_STEPS_PER_BATCH = 8
 SCORING_SPLIT_PRIORITY = ("test", "ood", "ood_t", "ood_n_t")
 NON_SCORING_SPLITS = frozenset(("train", "eval"))
 DEPTH_SPLIT_PREFIX = "depth_t_"
@@ -333,28 +337,55 @@ def _train(
     completed_steps = 0
     last_metric_step = 0
     optimizer_state_elements = 0
+    batch = None
+    reuse_batch = False
+    current_batch_uses = 0
+    if bundle.backward_passes_per_step > MAX_BACKWARD_PASSES_PER_STEP:
+        raise ValueError(
+            "OptimizerBundle.backward_passes_per_step exceeds the evaluator "
+            f"maximum of {MAX_BACKWARD_PASSES_PER_STEP}"
+        )
 
     for step in range(1, max_steps + 1):
         if time.monotonic() >= deadline:
             break
         validate_model_state(raw_model, manifest.model_state, device)
-        batch, iterator = _next_batch(iterator, dataloader)
-        optimizer.zero_grad(set_to_none=True)
-        loss, accuracy, _, _ = _loss_and_accuracy(
-            train_model,
-            batch,
-            manifest,
-            device,
-            training_loss=training_loss,
-            token_training_loss=token_training_loss,
-        )
-        if not torch.isfinite(loss).all().item():
-            raise FloatingPointError(f"non-finite training loss at step {step}")
-        loss.backward()
-        if manifest.runtime.grad_clip is not None:
-            torch.nn.utils.clip_grad_norm_(
-                raw_model.parameters(), manifest.runtime.grad_clip
+        if not reuse_batch:
+            batch, iterator = _next_batch(iterator, dataloader)
+            current_batch_uses = 0
+        current_batch_uses += 1
+
+        for pass_index in range(1, bundle.backward_passes_per_step + 1):
+            optimizer.zero_grad(set_to_none=True)
+            loss, accuracy, _, _ = _loss_and_accuracy(
+                train_model,
+                batch,
+                manifest,
+                device,
+                training_loss=training_loss,
+                token_training_loss=token_training_loss,
             )
+            if not torch.isfinite(loss).all().item():
+                raise FloatingPointError(
+                    f"non-finite training loss at step {step}, pass {pass_index}"
+                )
+            loss.backward()
+            if manifest.runtime.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    raw_model.parameters(), manifest.runtime.grad_clip
+                )
+            if (
+                pass_index < bundle.backward_passes_per_step
+                and bundle.between_backward_passes is not None
+            ):
+                with torch.no_grad():
+                    bundle.between_backward_passes(
+                        BackwardPassContext(
+                            completed_steps=completed_steps,
+                            pass_index=pass_index,
+                            total_passes=bundle.backward_passes_per_step,
+                        )
+                    )
         optimizer.step()
         if bundle.scheduler is not None:
             bundle.scheduler.step()
@@ -362,6 +393,25 @@ def _train(
         final_loss = float(loss.item())
         final_accuracy = accuracy
         completed_steps = step
+        reuse_batch = False
+        if (
+            bundle.should_reuse_batch is not None
+            and current_batch_uses < MAX_OPTIMIZER_STEPS_PER_BATCH
+        ):
+            with torch.no_grad():
+                reuse_decision = bundle.should_reuse_batch(
+                    BatchReuseContext(
+                        completed_steps=completed_steps,
+                        current_batch_uses=current_batch_uses,
+                        loss=final_loss,
+                    )
+                )
+            if type(reuse_decision) is not bool:
+                raise TypeError(
+                    "OptimizerBundle.should_reuse_batch must return bool"
+                )
+            reuse_batch = reuse_decision
+
         if step == 1:
             optimizer_state_elements = validate_optimizer(bundle, raw_model, device)
         if step == 1 or step % manifest.runtime.log_every == 0:

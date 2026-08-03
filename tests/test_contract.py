@@ -10,6 +10,7 @@ import torch
 
 from benchmark import (
     ModelSpec,
+    OptimizerBundle,
     OptimizerSpec,
     Submission,
     TokenLossBatch,
@@ -222,6 +223,44 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(submission.max_steps, 500)
         self.assertIsNone(submission.eval_batch_size)
         self.assertIsNone(submission.token_training_loss)
+
+    def test_optimizer_bundle_multi_pass_controls_validate(self) -> None:
+        model = torch.nn.Linear(1, 1)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+        bundle = OptimizerBundle(
+            optimizer,
+            scheduler,
+            backward_passes_per_step=2,
+            between_backward_passes=lambda context: None,
+            should_reuse_batch=lambda context: False,
+        )
+
+        validate_optimizer(bundle, model, torch.device("cpu"))
+        self.assertIs(bundle.scheduler, scheduler)
+
+        for value in (0, True, 1.5):
+            with self.subTest(backward_passes_per_step=value), self.assertRaisesRegex(
+                ValueError, "positive integer"
+            ):
+                validate_optimizer(
+                    OptimizerBundle(
+                        optimizer,
+                        backward_passes_per_step=value,
+                    ),
+                    model,
+                    torch.device("cpu"),
+                )
+
+        for field in ("between_backward_passes", "should_reuse_batch"):
+            with self.subTest(field=field), self.assertRaisesRegex(
+                TypeError, "must be callable"
+            ):
+                validate_optimizer(
+                    OptimizerBundle(optimizer, **{field: object()}),
+                    model,
+                    torch.device("cpu"),
+                )
 
     def test_removed_packages_and_harness_are_absent(self) -> None:
         self.assertFalse((ROOT / "model").exists())

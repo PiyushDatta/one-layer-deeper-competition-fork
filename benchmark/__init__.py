@@ -1,6 +1,8 @@
 """Strict architecture-and-optimizer benchmark interface."""
 
 from .api import (
+    BackwardPassContext,
+    BatchReuseContext,
     ModelSpec,
     OptimizerBundle,
     OptimizerSpec,
@@ -11,6 +13,8 @@ from .api import (
 )
 
 __all__ = [
+    "BackwardPassContext",
+    "BatchReuseContext",
     "ModelSpec",
     "OptimizerBundle",
     "OptimizerSpec",

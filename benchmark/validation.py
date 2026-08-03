@@ -85,6 +85,25 @@ def validate_optimizer(
         getattr(bundle.scheduler, "step", None)
     ):
         raise TypeError("OptimizerBundle.scheduler must expose step()")
+    if (
+        type(bundle.backward_passes_per_step) is not int
+        or bundle.backward_passes_per_step < 1
+    ):
+        raise ValueError(
+            "OptimizerBundle.backward_passes_per_step must be a positive integer"
+        )
+    if bundle.between_backward_passes is not None and not callable(
+        bundle.between_backward_passes
+    ):
+        raise TypeError(
+            "OptimizerBundle.between_backward_passes must be callable when provided"
+        )
+    if bundle.should_reuse_batch is not None and not callable(
+        bundle.should_reuse_batch
+    ):
+        raise TypeError(
+            "OptimizerBundle.should_reuse_batch must be callable when provided"
+        )
 
     expected = [
         parameter for parameter in model.parameters() if parameter.requires_grad
