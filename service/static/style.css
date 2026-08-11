@@ -18,6 +18,7 @@ a { color: inherit; }
 .brand-mark { width: 36px; height: 36px; display: grid; place-items: center; background: var(--ink); color: var(--acid); font: 800 13px ui-monospace, monospace; }
 nav { display: flex; gap: 24px; align-items: center; }
 nav a { text-decoration: none; font-size: 14px; font-weight: 650; }
+.competition-deadline { margin-top: 20px; padding: 14px 18px; border: 1px solid var(--ink); background: var(--acid); font: 700 13px/1.4 ui-monospace, monospace; text-align: center; }
 .button { border: 1px solid var(--ink); background: var(--ink); color: white; display: inline-flex; align-items: center; justify-content: space-between; gap: 24px; min-height: 48px; padding: 0 20px; text-decoration: none; font-weight: 750; cursor: pointer; }
 .button:hover { color: var(--ink); background: var(--acid); }
 .button.small { min-height: 36px; padding: 0 14px; color: var(--ink); background: var(--acid); }
@@ -34,11 +35,19 @@ h1 em { font-family: Georgia, serif; font-weight: 400; }
 .panel-head h2 { margin: 0; font-size: 18px; }
 .panel-head span, .panel-head a { color: var(--muted); font-size: 13px; }
 .table-wrap { overflow-x: auto; }
-table { width: 100%; border-collapse: collapse; min-width: 760px; }
+table { width: 100%; border-collapse: collapse; min-width: 680px; }
 th, td { padding: 18px 20px; border-bottom: 1px solid #dedcd3; text-align: left; }
 th { color: var(--muted); font: 650 11px ui-monospace, monospace; text-transform: uppercase; letter-spacing: .08em; }
 tbody tr:last-child td { border: 0; }
 .rank, .score { font: 750 17px ui-monospace, monospace; }
+.score-value { display: block; white-space: nowrap; }
+.score-progress {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
+  font: 650 11px/1.35 ui-monospace, monospace;
+  white-space: nowrap;
+}
 .entry { font-weight: 750; text-decoration-thickness: 1px; text-underline-offset: 4px; }
 .muted { color: var(--muted); font-size: 12px; }
 .block { display: block; margin-top: 5px; max-width: 500px; }
@@ -46,20 +55,22 @@ tbody tr:last-child td { border: 0; }
 .status.succeeded { background: var(--acid); color: var(--ink); border-color: var(--ink); }
 .status.failed { color: var(--danger); border-color: var(--danger); }
 .empty { padding: 50px; text-align: center; color: var(--muted); }
-.submit-grid { display: grid; grid-template-columns: 1.2fr .8fr; gap: 80px; padding: 100px 0 70px; align-items: end; }
+.submit-grid { display: grid; grid-template-columns: 1.2fr .8fr; gap: 80px; padding: 100px 0 70px; align-items: start; }
 .submit-grid h1 { font-size: clamp(50px, 7vw, 88px); }
 .beta-notice { max-width: 680px; margin-top: 24px; padding: 14px 16px; border: 1px solid var(--line); background: #fff6d8; color: var(--muted); font-size: 13px; line-height: 1.55; }
 .beta-notice strong { color: var(--ink); }
 .beta-notice a { color: var(--ink); font-weight: 700; text-underline-offset: 3px; }
-.submission-rules { max-width: 680px; margin-top: 35px; }
+.submission-rules { grid-column: 1 / -1; margin-top: 0; }
 .submission-rules h2 { margin: 0; font-size: 18px; }
-.submission-rules .rules { margin-top: 20px; }
+.submission-rules .rules { max-width: none; margin-top: 20px; }
 .rules { display: grid; grid-template-columns: 34px 1fr; gap: 15px 12px; margin-top: 35px; max-width: 680px; }
 .rules span { font: 700 11px ui-monospace, monospace; color: var(--muted); padding-top: 3px; }
 .rules p { margin: 0; line-height: 1.45; }
 .upload-card { background: var(--acid); border: 1px solid var(--ink); padding: 28px; min-height: 380px; display: flex; flex-direction: column; justify-content: space-between; gap: 24px; box-shadow: 10px 10px 0 var(--ink); }
+.upload-card.submissions-closed { background: #fff6d8; }
 .upload-card h2 { font-size: 28px; margin: 16px 0 6px; }
 .upload-card p { margin: 0; }
+.button:disabled { opacity: .6; cursor: not-allowed; }
 .file-kicker { display: grid; place-items: center; width: 48px; height: 48px; background: var(--ink); color: var(--acid); font: 800 13px ui-monospace, monospace; }
 .file-field { background: rgba(255,255,255,.55); border: 1px dashed var(--ink); min-height: 90px; display: flex; flex-direction: column; justify-content: center; gap: 8px; padding: 16px; font-weight: 700; }
 .file-field input { max-width: 100%; }

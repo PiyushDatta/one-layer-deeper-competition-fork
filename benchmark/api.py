@@ -74,11 +74,53 @@ class OptimizerSpec:
 
 
 @dataclass(frozen=True)
+class BackwardPassContext:
+    """Evaluator-owned position within a multi-pass optimizer update.
+
+    ``pass_index`` is one-based; ``completed_steps`` counts earlier updates.
+    """
+
+    completed_steps: int
+    pass_index: int
+    total_passes: int
+
+
+@dataclass(frozen=True)
+class BatchReuseContext:
+    """Detached post-update information for a bounded batch-reuse decision.
+
+    Both counters include the update or batch use that just completed.
+    """
+
+    completed_steps: int
+    current_batch_uses: int
+    loss: float
+
+
+@dataclass(frozen=True)
 class OptimizerBundle:
-    """Participant optimizer and optional participant-defined LR scheduler."""
+    """Participant optimizer and bounded evaluator-loop extensions."""
 
     optimizer: torch.optim.Optimizer
     scheduler: Scheduler | None = None
+    backward_passes_per_step: int = 1
+    between_backward_passes: Callable[[BackwardPassContext], None] | None = None
+    should_reuse_batch: Callable[[BatchReuseContext], bool] | None = None
+
+
+@dataclass(frozen=True)
+class TokenLossBatch:
+    """Boundary-preserving inputs for a participant-defined token loss.
+
+    Invalid target slots remain padded. ``valid_mask`` is authoritative and
+    must be used to exclude their labels, logits, and target positions.
+    """
+
+    logits: torch.Tensor
+    labels: torch.Tensor
+    valid_mask: torch.Tensor
+    target_positions: torch.Tensor | None
+    auxiliary: object
 
 
 @dataclass(frozen=True)
@@ -93,3 +135,4 @@ class Submission:
     batch_size: int | None = None
     max_steps: int | None = None
     eval_batch_size: int | None = None
+    token_training_loss: Callable[[TokenLossBatch], torch.Tensor] | None = None

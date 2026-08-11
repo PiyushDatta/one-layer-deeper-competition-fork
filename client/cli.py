@@ -28,6 +28,7 @@ CONFIG_PATH = Path(
     )
 )
 TERMINAL_STATUSES = {"succeeded", "failed"}
+DEPTH_LADDER = (1, 2, 4, 8, 16, 32, 64)
 
 
 def _server(value: str) -> str:
@@ -41,6 +42,46 @@ def _score(row: dict) -> str:
             "mean_exact_accuracy"
         )
     return "—" if value is None else f"{100 * float(value):.2f}%"
+
+
+
+def _max_t(row: dict, key: str) -> str:
+    profile = (row.get("result") or {}).get("depth_profile") or {}
+    if key == "ood_n_max_certified_time_steps":
+        available = row.get("ood_n_profile_available")
+        if available is None:
+            available = profile.get("ood_n_profile_available")
+        if available is False:
+            return "N/A"
+    value = row.get(key)
+    if value is None:
+        value = profile.get(key)
+    if value is None:
+        return "None certified" if row.get("status") == "succeeded" else "—"
+    return str(int(value))
+
+
+def _leaderboard_score(
+    row: dict,
+    key: str,
+    accuracy_key: str,
+    *,
+    available: bool = True,
+) -> str:
+    if not available:
+        return "N/A; Not evaluated"
+    value = row.get(key)
+    certified = 0 if value is None else int(value)
+    next_rung = next((rung for rung in DEPTH_LADDER if rung > certified), None)
+    if next_rung is None:
+        return f"T={DEPTH_LADDER[-1]}; Certified"
+    accuracy_percent = row.get(accuracy_key)
+    accuracy = (
+        f"Acc {float(accuracy_percent):.4f}%"
+        if accuracy_percent is not None
+        else "Acc unavailable"
+    )
+    return f"T={next_rung}; {accuracy}"
 
 
 def _load_saved_api_key(server: str) -> str | None:
@@ -87,6 +128,8 @@ def _print_status(row: dict) -> None:
     print(f"file        {row['filename']}")
     print(f"status      {row['status']}")
     print(f"score       {_score(row)}")
+    print(f"max T       {_max_t(row, 'max_certified_time_steps')}")
+    print(f"OOD N max T {_max_t(row, 'ood_n_max_certified_time_steps')}")
     print(f"tier        {row.get('tier') or 'legacy'}")
     print(f"dataset     {row.get('dataset_label') or row['manifest_name']}")
     print(f"suite       {row['manifest_name']}")
@@ -338,16 +381,32 @@ def command_leaderboard(args) -> int:
     if not rows:
         print("No submissions yet.")
         return 0
-    print("Hard leaderboard · best successful score per participant")
-    print(f"{'#':>3}  {'score':>8}  participant / file")
-    print(f"{'—' * 3}  {'—' * 8}  {'—' * 32}")
+    print(
+        "Hard leaderboard · ranked by Max T, OOD N Max T, "
+        "then unrounded next-rung accuracy"
+    )
+    print(f"{'#':>3}  participant")
+    print(f"{'—' * 3}  {'—' * 32}")
     for rank, row in enumerate(rows, start=1):
+        print(f"{rank:>3}  {row['submitter']}")
         print(
-            f"{rank:>3}  {_score(row):>8}  "
-            f"{row['submitter']} / {row['filename']}"
+            "     In Distribution N progress: "
+            + _leaderboard_score(
+                row,
+                "max_certified_time_steps",
+                "seen_tiebreak_accuracy_percent",
+            )
+        )
+        print(
+            "     Out of Distribution N progress: "
+            + _leaderboard_score(
+                row,
+                "ood_n_max_certified_time_steps",
+                "ood_n_tiebreak_accuracy_percent",
+                available=row.get("ood_n_profile_available") is not False,
+            )
         )
     return 0
-
 
 def _add_connection_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(

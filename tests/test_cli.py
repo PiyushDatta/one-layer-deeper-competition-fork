@@ -218,7 +218,15 @@ class CliTests(unittest.TestCase):
     def test_leaderboard_does_not_require_authentication(self) -> None:
         response = Mock()
         response.json.return_value = [
-            {"score": 0.5, "submitter": "Ada", "filename": "submission.py"}
+            {
+                "max_certified_time_steps": 32,
+                "ood_n_max_certified_time_steps": 16,
+                "ood_n_profile_available": True,
+                "seen_tiebreak_accuracy_percent": 82.4321,
+                "ood_n_tiebreak_accuracy_percent": 61.7654,
+                "submitter": "Ada",
+                "filename": "submission.py",
+            }
         ]
         args = build_parser().parse_args(
             ["leaderboard", "--server", "https://one-layer.example"]
@@ -232,7 +240,14 @@ class CliTests(unittest.TestCase):
             result = args.handler(args)
 
         self.assertEqual(result, 0)
-        self.assertIn("50.00%", output.getvalue())
+        self.assertIn(
+            "In Distribution N progress: T=64; Acc 82.4321%",
+            output.getvalue(),
+        )
+        self.assertIn(
+            "Out of Distribution N progress: T=32; Acc 61.7654%",
+            output.getvalue(),
+        )
         get.assert_called_once_with(
             "https://one-layer.example/api/leaderboard",
             timeout=30.0,

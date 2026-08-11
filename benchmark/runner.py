@@ -25,7 +25,15 @@ from data import (
     infer_vocab_size,
     make_dataloaders,
 )
-from .api import ModelSpec, OptimizerBundle, OptimizerSpec, Submission
+from .api import (
+    BackwardPassContext,
+    BatchReuseContext,
+    ModelSpec,
+    OptimizerBundle,
+    OptimizerSpec,
+    Submission,
+    TokenLossBatch,
+)
 from .batches import prepare_batch
 from .manifest import BenchmarkManifest, load_manifest
 from .metrics import MetricRecorder
@@ -40,17 +48,38 @@ from .validation import (
 
 
 EVALUATION_TIME_FRACTION = 0.5
+MAX_BACKWARD_PASSES_PER_STEP = 8
+MAX_OPTIMIZER_STEPS_PER_BATCH = 8
 SCORING_SPLIT_PRIORITY = ("test", "ood", "ood_t", "ood_n_t")
 NON_SCORING_SPLITS = frozenset(("train", "eval"))
+DEPTH_SPLIT_PREFIX = "depth_t_"
+OOD_N_DEPTH_SPLIT_PREFIX = "depth_ood_n_t_"
 
 
 def _scoring_split_names(dataloaders) -> tuple[str, ...]:
     """Return deterministic scored splits for final measurement."""
 
-    available = set(dataloaders) - NON_SCORING_SPLITS
+    available = {
+        name
+        for name in set(dataloaders) - NON_SCORING_SPLITS
+        if not name.startswith(
+            (DEPTH_SPLIT_PREFIX, OOD_N_DEPTH_SPLIT_PREFIX)
+        )
+    }
     prioritized = [name for name in SCORING_SPLIT_PRIORITY if name in available]
     remaining = sorted(available - set(prioritized))
     return tuple((*prioritized, *remaining))
+
+
+def _depth_split_names(
+    dataloaders, prefix: str = DEPTH_SPLIT_PREFIX
+) -> tuple[str, ...]:
+    names = [
+        name for name in dataloaders if name.startswith(prefix)
+    ]
+    return tuple(
+        sorted(names, key=lambda name: int(name.removeprefix(prefix)))
+    )
 
 
 def _deny_dataset_file_access(data_root: str | Path) -> None:
@@ -194,6 +223,7 @@ def _loss_and_accuracy(
     device: torch.device,
     *,
     training_loss=None,
+    token_training_loss=None,
 ) -> tuple[torch.Tensor, float, int, int]:
     input_ids, targets, attention_mask, target_positions = prepare_batch(
         batch,
@@ -242,12 +272,23 @@ def _loss_and_accuracy(
         valid = token_targets != -100
         if not valid.any().item():
             raise ValueError("batch contains no valid language-model targets")
-        loss_logits = token_logits[valid]
-        loss_labels = token_targets[valid]
-        if training_loss is None:
-            loss = F.cross_entropy(loss_logits, loss_labels)
+        if token_training_loss is not None:
+            loss = token_training_loss(
+                TokenLossBatch(
+                    logits=token_logits,
+                    labels=token_targets,
+                    valid_mask=valid,
+                    target_positions=target_positions,
+                    auxiliary=auxiliary,
+                )
+            )
         else:
-            loss = training_loss(loss_logits, loss_labels, auxiliary)
+            loss_logits = token_logits[valid]
+            loss_labels = token_targets[valid]
+            if training_loss is None:
+                loss = F.cross_entropy(loss_logits, loss_labels)
+            else:
+                loss = training_loss(loss_logits, loss_labels, auxiliary)
 
         token_predictions = token_logits.argmax(dim=-1)
         rows_with_targets = valid.any(dim=1)
@@ -261,7 +302,9 @@ def _loss_and_accuracy(
             raise TypeError("training_loss must return one scalar tensor")
         if loss.device != device:
             raise ValueError(f"training_loss must return a tensor on {device}")
-        if training_loss is not None and not loss.requires_grad:
+        if (
+            training_loss is not None or token_training_loss is not None
+        ) and not loss.requires_grad:
             raise ValueError("training_loss result must be differentiable")
 
     exact_accuracy = exact_rows.float().mean().item()
@@ -282,6 +325,7 @@ def _train(
     budget_seconds: float,
     max_steps: int,
     seed: int,
+    token_training_loss=None,
     metric_recorder: MetricRecorder | None = None,
 ) -> tuple[float | None, int, float, int]:
     optimizer = bundle.optimizer
@@ -293,27 +337,55 @@ def _train(
     completed_steps = 0
     last_metric_step = 0
     optimizer_state_elements = 0
+    batch = None
+    reuse_batch = False
+    current_batch_uses = 0
+    if bundle.backward_passes_per_step > MAX_BACKWARD_PASSES_PER_STEP:
+        raise ValueError(
+            "OptimizerBundle.backward_passes_per_step exceeds the evaluator "
+            f"maximum of {MAX_BACKWARD_PASSES_PER_STEP}"
+        )
 
     for step in range(1, max_steps + 1):
         if time.monotonic() >= deadline:
             break
         validate_model_state(raw_model, manifest.model_state, device)
-        batch, iterator = _next_batch(iterator, dataloader)
-        optimizer.zero_grad(set_to_none=True)
-        loss, accuracy, _, _ = _loss_and_accuracy(
-            train_model,
-            batch,
-            manifest,
-            device,
-            training_loss=training_loss,
-        )
-        if not torch.isfinite(loss).all().item():
-            raise FloatingPointError(f"non-finite training loss at step {step}")
-        loss.backward()
-        if manifest.runtime.grad_clip is not None:
-            torch.nn.utils.clip_grad_norm_(
-                raw_model.parameters(), manifest.runtime.grad_clip
+        if not reuse_batch:
+            batch, iterator = _next_batch(iterator, dataloader)
+            current_batch_uses = 0
+        current_batch_uses += 1
+
+        for pass_index in range(1, bundle.backward_passes_per_step + 1):
+            optimizer.zero_grad(set_to_none=True)
+            loss, accuracy, _, _ = _loss_and_accuracy(
+                train_model,
+                batch,
+                manifest,
+                device,
+                training_loss=training_loss,
+                token_training_loss=token_training_loss,
             )
+            if not torch.isfinite(loss).all().item():
+                raise FloatingPointError(
+                    f"non-finite training loss at step {step}, pass {pass_index}"
+                )
+            loss.backward()
+            if manifest.runtime.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    raw_model.parameters(), manifest.runtime.grad_clip
+                )
+            if (
+                pass_index < bundle.backward_passes_per_step
+                and bundle.between_backward_passes is not None
+            ):
+                with torch.no_grad():
+                    bundle.between_backward_passes(
+                        BackwardPassContext(
+                            completed_steps=completed_steps,
+                            pass_index=pass_index,
+                            total_passes=bundle.backward_passes_per_step,
+                        )
+                    )
         optimizer.step()
         if bundle.scheduler is not None:
             bundle.scheduler.step()
@@ -321,6 +393,25 @@ def _train(
         final_loss = float(loss.item())
         final_accuracy = accuracy
         completed_steps = step
+        reuse_batch = False
+        if (
+            bundle.should_reuse_batch is not None
+            and current_batch_uses < MAX_OPTIMIZER_STEPS_PER_BATCH
+        ):
+            with torch.no_grad():
+                reuse_decision = bundle.should_reuse_batch(
+                    BatchReuseContext(
+                        completed_steps=completed_steps,
+                        current_batch_uses=current_batch_uses,
+                        loss=final_loss,
+                    )
+                )
+            if type(reuse_decision) is not bool:
+                raise TypeError(
+                    "OptimizerBundle.should_reuse_batch must return bool"
+                )
+            reuse_batch = reuse_decision
+
         if step == 1:
             optimizer_state_elements = validate_optimizer(bundle, raw_model, device)
         if step == 1 or step % manifest.runtime.log_every == 0:
@@ -398,8 +489,84 @@ def _evaluate(
     if example_count == 0 or loss_count == 0:
         raise ValueError("evaluation split contains no labels")
     accuracy = correct_sum / example_count
-    return {"loss": loss_sum / loss_count, "exact_accuracy": accuracy}
+    return {
+        "loss": loss_sum / loss_count,
+        "exact_accuracy": accuracy,
+        "correct_examples": int(round(correct_sum)),
+        "example_count": example_count,
+    }
 
+
+
+def _evaluate_depth_profile(
+    *,
+    model: nn.Module,
+    dataloaders,
+    manifest: BenchmarkManifest,
+    device: torch.device,
+    deadline: float,
+    budget_seconds: float,
+    seed: int,
+    prefix: str,
+    label: str,
+) -> dict:
+    split_names = _depth_split_names(dataloaders, prefix)
+    ladder = [int(name.removeprefix(prefix)) for name in split_names]
+    rungs = []
+    prefix_solved = True
+    max_certified_time_steps = None
+    for split_name in split_names:
+        time_steps = int(split_name.removeprefix(prefix))
+        try:
+            metrics = _evaluate(
+                model,
+                dataloaders[split_name],
+                manifest,
+                device,
+                deadline=deadline,
+                budget_seconds=budget_seconds,
+            )
+        except TimeoutError:
+            rungs.append(
+                {
+                    "time_steps": time_steps,
+                    "status": "not_completed",
+                    "correct_examples": 0,
+                    "example_count": len(dataloaders[split_name].dataset),
+                    "exact_accuracy": None,
+                }
+            )
+            break
+        solved = metrics["correct_examples"] == metrics["example_count"]
+        prefix_solved = prefix_solved and solved
+        if prefix_solved:
+            max_certified_time_steps = time_steps
+        rungs.append(
+            {
+                "time_steps": time_steps,
+                "status": (
+                    "certified"
+                    if prefix_solved
+                    else "passed_uncertified"
+                    if solved
+                    else "failed"
+                ),
+                "correct_examples": metrics["correct_examples"],
+                "example_count": metrics["example_count"],
+                "exact_accuracy": metrics["exact_accuracy"],
+            }
+        )
+        print(
+            f"seed={seed} profile={label} depth_t={time_steps} "
+            f"exact_accuracy={metrics['exact_accuracy']:.6f} "
+            f"certified={prefix_solved}",
+            flush=True,
+        )
+    return {
+        "ladder": ladder,
+        "max_certified_time_steps": max_certified_time_steps,
+        "rungs": rungs,
+    }
 
 def _run_seed(
     submission: Submission,
@@ -473,6 +640,7 @@ def _run_seed(
         raw_model=model,
         train_model=train_model,
         training_loss=submission.training_loss,
+        token_training_loss=submission.token_training_loss,
         bundle=bundle,
         dataloader=dataloaders["train"],
         manifest=manifest,
@@ -512,6 +680,38 @@ def _run_seed(
                 loss=metrics["loss"],
                 exact_accuracy=metrics["exact_accuracy"],
             )
+    depth_profile = _evaluate_depth_profile(
+        model=model,
+        dataloaders=dataloaders,
+        manifest=manifest,
+        device=device,
+        deadline=evaluation_deadline,
+        budget_seconds=evaluation_budget_seconds,
+        seed=seed,
+        prefix=DEPTH_SPLIT_PREFIX,
+        label="seen_n",
+    )
+    ood_n_depth_profile = _evaluate_depth_profile(
+        model=model,
+        dataloaders=dataloaders,
+        manifest=manifest,
+        device=device,
+        deadline=evaluation_deadline,
+        budget_seconds=evaluation_budget_seconds,
+        seed=seed,
+        prefix=OOD_N_DEPTH_SPLIT_PREFIX,
+        label="ood_n",
+    )
+    depth_profile.update(
+        {
+            "depth_factor": depth_profile["max_certified_time_steps"] or 0,
+            "ood_n_ladder": ood_n_depth_profile["ladder"],
+            "ood_n_max_certified_time_steps": ood_n_depth_profile[
+                "max_certified_time_steps"
+            ],
+            "ood_n_rungs": ood_n_depth_profile["rungs"],
+        }
+    )
     evaluation_seconds = time.monotonic() - evaluation_started_at
 
     return {
@@ -527,6 +727,7 @@ def _run_seed(
         "evaluation_budget_seconds": evaluation_budget_seconds,
         "evaluation_seconds": evaluation_seconds,
         "evaluation": evaluation,
+        "depth_profile": depth_profile,
     }
 
 
@@ -633,6 +834,30 @@ def run_submission_file(
         },
         "seeds": seed_results,
     }
+    if any(seed_result["depth_profile"]["ladder"] for seed_result in seed_results):
+        certified_time_steps = min(
+            seed_result["depth_profile"]["max_certified_time_steps"] or 0
+            for seed_result in seed_results
+        )
+        ood_n_certified_time_steps = min(
+            seed_result["depth_profile"]["ood_n_max_certified_time_steps"] or 0
+            for seed_result in seed_results
+        )
+        result["depth_profile"] = {
+            "ladder": seed_results[0]["depth_profile"]["ladder"],
+            "max_certified_time_steps": certified_time_steps or None,
+            "ood_n_ladder": seed_results[0]["depth_profile"]["ood_n_ladder"],
+            "ood_n_profile_available": bool(
+                seed_results[0]["depth_profile"]["ood_n_ladder"]
+            ),
+            "ood_n_max_certified_time_steps": (
+                ood_n_certified_time_steps or None
+            ),
+            "depth_factor": min(
+                seed_result["depth_profile"]["depth_factor"]
+                for seed_result in seed_results
+            ),
+        }
     if metric_recorder is not None:
         metric_recorder.record_summary(
             completed_steps=sum(

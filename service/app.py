@@ -29,6 +29,11 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from .auth import bearer_api_key
+from .competition import (
+    SubmissionsClosed,
+    require_submissions_open,
+    submissions_are_closed,
+)
 from .config import Settings
 from .db import DailyQuotaExceeded, Database, failure_code_for_error
 from .evaluator import evaluate_run
@@ -140,6 +145,27 @@ def _participant_submission_payload(row: dict) -> dict:
     return payload
 
 
+def _public_leaderboard_payload(row: dict) -> dict:
+    fields = (
+        "id",
+        "filename",
+        "status",
+        "created_at",
+        "manifest_name",
+        "tier",
+        "dataset_id",
+        "dataset_label",
+        "finished_at",
+        "submitter",
+        "max_certified_time_steps",
+        "ood_n_max_certified_time_steps",
+        "ood_n_profile_available",
+        "seen_tiebreak_accuracy_percent",
+        "ood_n_tiebreak_accuracy_percent",
+    )
+    return {field: row.get(field) for field in fields}
+
+
 async def _read_submission(file: UploadFile) -> tuple[str, str]:
     raw = await file.read(settings.max_submission_bytes + 1)
     try:
@@ -162,6 +188,7 @@ def _queue_submission(
     tier_id: str,
     dataset_id: str | None,
 ) -> tuple[UUID, UUID, int | None]:
+    require_submissions_open()
     tier, dataset = resolve_tier_dataset(tier_id, dataset_id)
     submission_id, run_id, remaining_attempts = database.create_submission(
         user_id=user["id"],
@@ -197,7 +224,8 @@ def problem() -> str:
 
 @app.get("/submit", response_class=HTMLResponse)
 def submit_form() -> str:
-    return submit_page()
+    closed = submissions_are_closed()
+    return submit_page(submissions_are_closed=closed)
 
 
 @app.get("/register", response_class=HTMLResponse)
@@ -261,6 +289,18 @@ async def submit(
     dataset: str | None = Form(default=None),
 ):
     try:
+        require_submissions_open()
+    except SubmissionsClosed as exc:
+        return HTMLResponse(
+            submit_page(
+                str(exc),
+                selected_tier=tier,
+                selected_dataset=dataset,
+                submissions_are_closed=True,
+            ),
+            status_code=410,
+        )
+    try:
         user = database.authenticate_api_key(api_key)
     except (ValueError, PermissionError) as exc:
         return HTMLResponse(
@@ -283,6 +323,16 @@ async def submit(
             source,
             tier,
             dataset,
+        )
+    except SubmissionsClosed as exc:
+        return HTMLResponse(
+            submit_page(
+                str(exc),
+                selected_tier=tier,
+                selected_dataset=dataset,
+                submissions_are_closed=True,
+            ),
+            status_code=410,
         )
     except DailyQuotaExceeded as exc:
         return HTMLResponse(
@@ -310,6 +360,10 @@ async def submit_api(
     dataset: str | None = Form(default=None),
     authorization: str | None = Header(default=None),
 ):
+    try:
+        require_submissions_open()
+    except SubmissionsClosed as exc:
+        raise HTTPException(status_code=410, detail=str(exc)) from exc
     user = _api_user(authorization)
     try:
         filename, source = await _read_submission(file)
@@ -325,6 +379,8 @@ async def submit_api(
             tier,
             dataset,
         )
+    except SubmissionsClosed as exc:
+        raise HTTPException(status_code=410, detail=str(exc)) from exc
     except DailyQuotaExceeded as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
     except ValueError as exc:
@@ -382,7 +438,8 @@ def sample_submission():
 
 @app.get("/api/leaderboard")
 def leaderboard_api():
-    return JSONResponse(jsonable_encoder(database.leaderboard()))
+    rows = [_public_leaderboard_payload(row) for row in database.leaderboard()]
+    return JSONResponse(jsonable_encoder(rows))
 
 
 @app.get("/api/submissions/{submission_id}")

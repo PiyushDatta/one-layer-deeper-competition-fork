@@ -5,6 +5,11 @@ from __future__ import annotations
 from html import escape
 import json
 
+from .competition import (
+    BETA_END_LABEL,
+    SUBMISSION_DEADLINE_LABEL,
+    SUBMISSIONS_CLOSED_MESSAGE,
+)
 from .tiers import TIERS, TIER_BY_ID
 
 
@@ -25,6 +30,9 @@ def _layout(title: str, content: str, *, refresh: bool = False) -> str:
     <a class="brand" href="/"><span class="brand-mark">1L↓</span> One Layer Deeper</a>
     <nav><a href="/">Leaderboard</a><a href="/problem">Problem</a><a href="/register">Sign in</a><a class="button small" href="/submit">Submit</a></nav>
   </header>
+  <aside class="shell competition-deadline" aria-label="Competition submission deadline">
+    <strong>Submission deadline:</strong> {escape(SUBMISSION_DEADLINE_LABEL)}.
+  </aside>
   <main class="shell">{content}</main>
   <footer class="shell">
     <strong>Core Automation × Tilde Research</strong><br>
@@ -81,10 +89,11 @@ def problem_page() -> str:
       </article>
 
       <article class="panel problem-copy">
-        <div class="panel-head"><h2>How it is scored</h2><span>Exact accuracy</span></div>
+        <div class="panel-head"><h2>How it is scored</h2><span>Certified Max T</span></div>
         <div class="problem-card-body">
           <p>An example counts as correct only when every target token is correct. A nearly right residue earns no partial credit for that example.</p>
-          <p>Hard uses a private hidden evaluator. Easy and Medium equally average test and their merged out-of-distribution split.</p>
+          <p>Hard ranks by the largest consecutively certified T on in-distribution modulus identities, then by the corresponding Max T on out-of-distribution modulus sizes. Ties use accuracy at each profile's first uncertified rung. Every example in every rung through Max T must be exactly correct.</p>
+          <p><strong>Hard is a hidden task evaluation and may change aspects of the recurrence itself; do not assume it is repeated squaring.</strong></p>
         </div>
       </article>
     </section>
@@ -110,20 +119,60 @@ def problem_page() -> str:
     return _layout("Problem", content)
 
 
+DEPTH_LADDER = (1, 2, 4, 8, 16, 32, 64)
+
+
+def _max_t_text(value, *, available: bool = True) -> str:
+    if not available:
+        return "N/A"
+    if value is None or int(value) < 1:
+        return "None certified"
+    return str(int(value))
+
+
+def _progress_display(
+    value,
+    accuracy_percent,
+    *,
+    available: bool = True,
+) -> tuple[str, str]:
+    if not available:
+        return "N/A", "Not evaluated"
+    certified = 0 if value is None else int(value)
+    next_rung = next((rung for rung in DEPTH_LADDER if rung > certified), None)
+    if next_rung is None:
+        return f"T={DEPTH_LADDER[-1]}", "Certified"
+    accuracy = (
+        f"Acc {float(accuracy_percent):.4f}%"
+        if accuracy_percent is not None
+        else "Acc unavailable"
+    )
+    return f"T={next_rung}", accuracy
+
+
 def leaderboard_page(rows: list[dict]) -> str:
     ranks = {str(row["id"]): rank for rank, row in enumerate(rows, start=1)}
     table_rows = []
     for row in rows:
         rank = ranks.get(str(row["id"]), "—")
-        score = "—" if row["score"] is None else f"{100 * row['score']:.2f}%"
+        max_t, max_t_accuracy = _progress_display(
+            row.get("max_certified_time_steps"),
+            row.get("seen_tiebreak_accuracy_percent"),
+        )
+        ood_n_max_t, ood_n_max_t_accuracy = _progress_display(
+            row.get("ood_n_max_certified_time_steps"),
+            row.get("ood_n_tiebreak_accuracy_percent"),
+            available=row.get("ood_n_profile_available") is not False,
+        )
         submitter = row["submitter"]
         table_rows.append(
             f"""<tr>
               <td class="rank">{rank}</td>
-              <td><a class="entry" href="/submissions/{row["id"]}">{escape(submitter)}</a>
-                  <span class="muted block">{escape(row["filename"])}</span></td>
-              <td class="score">{score}</td>
-              <td class="muted">{escape(str(row.get("dataset_label") or row["manifest_name"]))}</td>
+              <td><a class="entry" href="/submissions/{row["id"]}">{escape(submitter)}</a></td>
+              <td class="score"><span class="score-value">{escape(max_t)}</span>
+                  <span class="score-progress">{escape(max_t_accuracy)}</span></td>
+              <td class="score"><span class="score-value">{escape(ood_n_max_t)}</span>
+                  <span class="score-progress">{escape(ood_n_max_t_accuracy)}</span></td>
             </tr>"""
         )
     empty = "" if table_rows else '<div class="empty">No submissions yet.</div>'
@@ -140,9 +189,9 @@ def leaderboard_page(rows: list[dict]) -> str:
     </section>
     <section class="panel">
       <div class="panel-head"><h2>Leaderboard</h2><span>{len(rows)} ranked</span></div>
-      <div class="notice"><strong>Hard leaderboard:</strong> each participant is ranked once by their best successful Hard score. Easy and Medium are private practice runs; source and run details remain private.</div>
+      <div class="notice"><strong>Higher is better.</strong> Each score cell shows the next T to certify and its accuracy, rounded to four decimal places. Once every example at that T is correct, the target advances from T=1 to 2, 4, 8, 16, 32, then 64. Max T uses in-distribution number sizes; OOD N Max T uses out-of-distribution number sizes. Ranking uses the unrounded accuracies.</div>
       <div class="table-wrap"><table>
-        <thead><tr><th>#</th><th>Participant / file</th><th>Exact accuracy</th><th>Dataset</th></tr></thead>
+        <thead><tr><th>#</th><th>Participant</th><th>In Distribution N progress</th><th>Out of Distribution N progress</th></tr></thead>
         <tbody>{"".join(table_rows)}</tbody>
       </table></div>{empty}
     </section>"""
@@ -154,7 +203,10 @@ def submit_page(
     *,
     selected_tier: str = "easy",
     selected_dataset: str | None = None,
+    submissions_are_closed: bool = False,
 ) -> str:
+    if submissions_are_closed and error is None:
+        error = SUBMISSIONS_CLOSED_MESSAGE
     error_html = f'<div class="error">{escape(error)}</div>' if error else ""
     tier = TIER_BY_ID.get(selected_tier, TIER_BY_ID["easy"])
     valid_dataset_ids = {dataset.id for dataset in tier.datasets}
@@ -184,40 +236,56 @@ def submit_page(
         }
     )
     dataset_hidden = " hidden" if tier.id == "hard" else ""
-    dataset_disabled = " disabled" if tier.id == "hard" else ""
+    control_disabled = " disabled" if submissions_are_closed else ""
+    dataset_disabled = (
+        " disabled" if tier.id == "hard" or submissions_are_closed else ""
+    )
+    upload_card_class = (
+        "upload-card submissions-closed"
+        if submissions_are_closed
+        else "upload-card"
+    )
+    submit_label = (
+        "Submissions closed"
+        if submissions_are_closed
+        else "Queue H100 evaluation"
+    )
     content = f"""
     <section class="submit-grid">
       <div><p class="eyebrow">Single-file contract</p><h1>Ship the idea,<br><em>not the pipeline.</em></h1>
       <p class="lede">Upload one <code>submission.py</code>, then choose a practice dataset or the ranked Hard evaluation.</p>
-      <aside class="beta-notice"><strong>Beta:</strong> We're refining the competition and would love your feedback before we finalize the rules in the near future. Share your thoughts in the <a href="https://discord.gg/gpumode">GPU MODE Discord</a> <code>#one-layer-deeper</code> channel.</aside>
+      <aside class="beta-notice"><strong>Beta:</strong> The beta runs from July 31 through {escape(BETA_END_LABEL)}. The competition continues through {escape(SUBMISSION_DEADLINE_LABEL)}. We are using the beta to refine the competition and finalize the rules, so share your feedback in the <a href="https://discord.gg/gpumode">GPU MODE Discord</a> <code>#one-layer-deeper</code> channel.</aside>
       <div class="rules"><span>01</span><p><strong>Artifact:</strong> one UTF-8 file named <code>submission.py</code>, up to 256 KiB. Imports may use the public benchmark API and pinned evaluator dependencies—no extra files, repository implementation modules, or installs.</p>
       <span>02</span><p><strong>Model factory:</strong> receives only tensor shapes, I/O requirements, and the model-state ceiling.</p>
-      <span>03</span><p><strong>Training loss:</strong> optionally turn final logits, auxiliary outputs, and current labels into one scalar loss. The evaluator performs one backward pass.</p>
+      <span>03</span><p><strong>Training loss:</strong> optionally use the legacy flattened callback or a boundary-preserving <code>TokenLossBatch</code> to produce one scalar loss per evaluator-owned pass. The evaluator performs backward.</p>
       <span>04</span><p><strong>Optimizer factory:</strong> receives the model, per-seed H100 time allowance, and device type. Include every trainable parameter exactly once; custom optimizers and schedules are welcome.</p>
       <span>05</span><p><strong>Use the whole machine:</strong> optimizer state, activations, memory tokens, and temporary workspace may use available VRAM. An OOM or timeout fails the run; only persistent model state is capped.</p>
-      <span>06</span><p><strong>Evaluator boundary:</strong> choose a training and evaluation batch size and an optional lower step limit; the evaluator still fixes data, sampling, one forward, one backward, clipping, optimizer cadence, deadline, final evaluation, and score. Final evaluation has a separate time budget equal to half the training allowance.</p></div>
+      <span>06</span><p><strong>Evaluator boundary:</strong> choose batch sizes and an optional lower step limit; the evaluator still fixes data order and owns model/loss invocation, backward, clipping, optimizer cadence, deadline, final evaluation, and score. An <code>OptimizerBundle</code> may request up to eight evaluator-owned backward passes per update and bounded dynamic reuse of a batch for up to eight updates. Recurrent mechanisms, TRMs, and optimizer-side curvature or Hessian approximations are welcome. Final evaluation has a separate time budget equal to half the training allowance.</p></div>
+      </div>
+      <form class="{upload_card_class}" action="/submit" method="post" enctype="multipart/form-data">
+        <div><span class="file-kicker">PY</span><h2>Upload submission.py</h2><p>One self-contained Python file, up to 256 KiB.</p></div>
+        {error_html}
+        <label class="text-field"><span>API key</span><input name="api_key" type="password" autocomplete="off" placeholder="old_…" required{control_disabled}></label>
+        <label class="text-field"><span>Compute tier</span><select id="tier-select" name="tier" required{control_disabled}>{tier_options}</select></label>
+        <label id="dataset-field" class="text-field"{dataset_hidden}><span>Dataset</span><select id="dataset-select" name="dataset"{dataset_disabled}>{dataset_options}</select></label>
+        <div class="tier-note"><strong>Daily limits use UTC:</strong> Easy 60 · Medium 6 · Hard 1. Accepted failed runs count; rejected uploads do not.</div>
+        <label class="file-field"><span>Choose submission.py</span><input name="file" type="file" accept=".py,text/x-python" required{control_disabled}></label>
+        <button class="button" type="submit"{control_disabled}>{submit_label}</button>
+        <p class="form-note">No key yet? <a href="/register">Sign in with GitHub</a>. CLI users run <code>one-layer login</code> once; submissions must pass <code>--tier</code> and, for Easy or Medium, <code>--dataset</code>. Only the best successful Hard score per participant is ranked.</p>
+      </form>
       <section class="submission-rules" aria-labelledby="submission-rules-heading">
         <h2 id="submission-rules-heading">Rules</h2>
         <div class="rules">
           <span>01</span><p><strong>Maximum 500 million trainable parameters.</strong></p>
           <span>02</span><p><strong>No hard-coded weights.</strong> Trainable weights must use a random initialization and be updated during training. For example, <code>torch.load</code> is not allowed.</p>
           <span>03</span><p><strong>No hard-coded algorithm in the forward pass.</strong> Outputs must be produced by the learned model.</p>
-          <span>04</span><p><strong>Everything stays on the GPU.</strong> Model state and computation must remain on the GPU throughout training and evaluation; CPU offloading is not allowed.</p>
-          <span>05</span><p><strong>Repeated rule-breaking will get you banned.</strong> We still encourage creativity: discussing possible loopholes on Discord or testing one in a submission won't get you banned.</p>
-          <span>06</span><p><strong>The metric recorder for a Hard run must not be exploited.</strong> Any attempt to exploit it will result in an immediate ban.</p>
+          <span>04</span><p><strong>End-to-end learning only.</strong> Final logits must be produced entirely by the submitted model from its inputs and learned PyTorch state, with all input-dependent computation inside the autograd graph and an unbroken gradient path from the loss to the parameters responsible for the prediction.</p>
+          <span>05</span><p><strong>Everything stays on the GPU.</strong> Model state and computation must remain on the GPU throughout training and evaluation; CPU offloading is not allowed.</p>
+          <span>06</span><p><strong>Repeated rule-breaking will get you banned.</strong> We still encourage creativity: discussing possible loopholes on Discord or testing one in a submission won't get you banned.</p>
+          <span>07</span><p><strong>The metric recorder for a Hard run must not be exploited.</strong> Any attempt to exploit it will result in an immediate ban.</p>
+          <span>08</span><p><strong>No hidden training loops.</strong> Hooks and callbacks may not invoke nested model/loss calls, derivative-engine entry points, optimizer/scheduler steps, or otherwise perform hidden training work. Only the intermediate callback may transform gradients, parameters, or optimizer state; the batch-reuse callback may only read its detached context and return a boolean.</p>
         </div>
-      </section></div>
-      <form class="upload-card" action="/submit" method="post" enctype="multipart/form-data">
-        <div><span class="file-kicker">PY</span><h2>Upload submission.py</h2><p>One self-contained Python file, up to 256 KiB.</p></div>
-        {error_html}
-        <label class="text-field"><span>API key</span><input name="api_key" type="password" autocomplete="off" placeholder="old_…" required></label>
-        <label class="text-field"><span>Compute tier</span><select id="tier-select" name="tier" required>{tier_options}</select></label>
-        <label id="dataset-field" class="text-field"{dataset_hidden}><span>Dataset</span><select id="dataset-select" name="dataset"{dataset_disabled}>{dataset_options}</select></label>
-        <div class="tier-note"><strong>Daily limits use UTC:</strong> Easy 60 · Medium 6 · Hard 1. Accepted failed runs count; rejected uploads do not.</div>
-        <label class="file-field"><span>Choose submission.py</span><input name="file" type="file" accept=".py,text/x-python" required></label>
-        <button class="button" type="submit">Queue H100 evaluation</button>
-        <p class="form-note">No key yet? <a href="/register">Sign in with GitHub</a>. CLI users run <code>one-layer login</code> once; submissions must pass <code>--tier</code> and, for Easy or Medium, <code>--dataset</code>. Only the best successful Hard score per participant is ranked.</p>
-      </form>
+      </section>
       <script>
       (() => {{
         const catalog = {dataset_catalog};
@@ -241,7 +309,7 @@ def submit_page(
       </script>
     </section>
     <section class="contract panel"><div class="panel-head"><h2>Contract sketch</h2><a href="/samples/submission.py">Download sample</a></div>
-<pre><code>from benchmark import ModelSpec, OptimizerSpec, OptimizerBundle, Submission, assert_model_state
+<pre><code>from benchmark import ModelSpec, OptimizerSpec, OptimizerBundle, Submission, TokenLossBatch, assert_model_state
 
 def build_model(spec: ModelSpec):
     model = MyModel(spec)
@@ -253,13 +321,13 @@ def build_optimizer(model, spec: OptimizerSpec):
     scheduler = MySchedule(optimizer, spec.training_time_seconds)
     return OptimizerBundle(optimizer, scheduler=scheduler)
 
-def training_loss(logits, labels, auxiliary):
-    return my_loss(logits, labels, auxiliary)
+def token_training_loss(batch: TokenLossBatch):
+    return my_sequence_loss(batch.logits, batch.labels, batch.valid_mask)
 
 SUBMISSION = Submission(
     build_model=build_model,
     build_optimizer=build_optimizer,
-    training_loss=training_loss,  # optional
+    token_training_loss=token_training_loss,  # optional
     batch_size=512,  # optional; training
     eval_batch_size=1024,  # optional; evaluation
     max_steps=20_000,  # optional
@@ -333,8 +401,17 @@ one-layer submit submission.py --tier easy --dataset e1 --wait</code></pre>
 
 
 def submission_page(row: dict) -> str:
-    score = row.get("score")
-    score_text = "Pending" if score is None else f"{100 * score:.2f}%"
+    if row["status"] == "succeeded":
+        max_t = _max_t_text(row.get("max_certified_time_steps"))
+        ood_n_available = row.get("ood_n_profile_available")
+        if ood_n_available is None:
+            ood_n_available = row.get("ood_n_max_certified_time_steps") is not None
+        ood_n_max_t = _max_t_text(
+            row.get("ood_n_max_certified_time_steps"), available=ood_n_available
+        )
+    else:
+        max_t = "Pending"
+        ood_n_max_t = "Pending"
     submitter = row["submitter"]
     failure = (
         '<div class="error"><strong>Evaluation failed.</strong> The participant can inspect the private error through the authenticated CLI.</div>'
@@ -344,7 +421,7 @@ def submission_page(row: dict) -> str:
     content = f"""
     <section class="detail-hero"><div><p class="eyebrow">Participant</p><h1>{escape(submitter)}</h1>
     <p class="lede">{escape(row["filename"])}</p></div>
-    <div class="score-card"><span>Exact accuracy</span><strong>{score_text}</strong><span class="status {escape(row["status"])}">{escape(row["status"])}</span></div></section>
+    <div class="score-card"><span>Max T</span><strong>{escape(max_t)}</strong><span>OOD N Max T</span><b>{escape(ood_n_max_t)}</b><span class="status {escape(row["status"])}">{escape(row["status"])}</span></div></section>
     {failure}
     <section class="facts panel"><div><span>Participant</span><strong>{escape(submitter)}</strong></div>
     <div><span>Filename</span><strong>{escape(row["filename"])}</strong></div>
