@@ -1,0 +1,31 @@
+{
+  "name": "squaring-mod-medium-m8",
+  "data": {
+    "kind": "squaring_mod",
+    "data_root": "data/generated/squaring_mod_granular_medium_m8_bidirectional_fixed_n_1333_t124",
+    "batch_size": 512,
+    "eval_batch_size": 512,
+    "shuffle_train": true,
+    "shuffle_eval": false,
+    "num_workers": 2,
+    "pin_memory": true,
+    "drop_last": true,
+    "seed": 45
+  },
+  "runtime": {
+    "device": "cuda:0",
+    "dtype": "bfloat16",
+    "amp": true,
+    "compile": false,
+    "total_training_time_seconds": 600,
+    "max_steps": 1000000,
+    "seeds": [
+      74
+    ],
+    "grad_clip": 1,
+    "log_every": 100
+  },
+  "model_state": {
+    "maximum_elements": 500000000
+  }
+}

@@ -11,7 +11,7 @@ set -euo pipefail
 # representation; results from the former causal-LM datasets are not comparable.
 
 # ---------------------------------------------------------------------------
-# Easy: five datasets using the one-minute training budget.
+# Easy: ten datasets using the one-minute training budget.
 # ---------------------------------------------------------------------------
 
 # E1: tiny fixed N with three ID depths.
@@ -79,8 +79,73 @@ python -m data.squaring_mod \
   --train_fraction 0.8 --test_fraction 0.2 \
   --split_group prompt --seed 45 --separate_input_output true
 
+# E6: top-signal rung with one additional supervised depth.
+python -m data.squaring_mod \
+  --output_dir data/generated/squaring_mod_granular_easy_e6_bidirectional_fixed_n_247_t1234 \
+  --fixed_p 13 --fixed_q 19 \
+  --time_steps '[1,2,3,4]' --ood_time_steps '[5]' \
+  --examples_per_setting 184 --ood_examples_per_setting 60 \
+  --depth_evaluation_time_steps '[1,2,4,8,16,32,64]' \
+  --depth_evaluation_examples_per_setting 32 \
+  --ood_n_depth_evaluation_modulus_bits '[9,10]' \
+  --ood_n_depth_evaluation_examples_per_setting 128 \
+  --train_fraction 0.8 --test_fraction 0.2 \
+  --split_group prompt --seed 45 --separate_input_output true
+
+# E7: same shallow training support with a nearby T=4 holdout.
+python -m data.squaring_mod \
+  --output_dir data/generated/squaring_mod_granular_easy_e7_bidirectional_fixed_n_287_t123_ood4 \
+  --fixed_p 7 --fixed_q 41 \
+  --time_steps '[1,2,3]' --ood_time_steps '[4]' \
+  --examples_per_setting 220 --ood_examples_per_setting 85 \
+  --depth_evaluation_time_steps '[1,2,4,8,16,32,64]' \
+  --depth_evaluation_exhaustive_x true \
+  --ood_n_depth_evaluation_modulus_bits '[10,11]' \
+  --ood_n_depth_evaluation_examples_per_setting 128 \
+  --train_fraction 0.8 --test_fraction 0.2 \
+  --split_group prompt --seed 45 --separate_input_output true
+
+# E8: same N as E7, with the harder T=6 holdout.
+python -m data.squaring_mod \
+  --output_dir data/generated/squaring_mod_granular_easy_e8_bidirectional_fixed_n_287_t123 \
+  --fixed_p 7 --fixed_q 41 \
+  --time_steps '[1,2,3]' --ood_time_steps '[6]' \
+  --examples_per_setting 220 --ood_examples_per_setting 85 \
+  --depth_evaluation_time_steps '[1,2,4,8,16,32,64]' \
+  --depth_evaluation_exhaustive_x true \
+  --ood_n_depth_evaluation_modulus_bits '[10,11]' \
+  --ood_n_depth_evaluation_examples_per_setting 128 \
+  --train_fraction 0.8 --test_fraction 0.2 \
+  --split_group prompt --seed 45 --separate_input_output true
+
+# E9: larger fixed modulus with the T=6 holdout.
+python -m data.squaring_mod \
+  --output_dir data/generated/squaring_mod_granular_easy_e9_bidirectional_fixed_n_299_t123 \
+  --fixed_p 13 --fixed_q 23 \
+  --time_steps '[1,2,3]' --ood_time_steps '[6]' \
+  --examples_per_setting 250 --ood_examples_per_setting 90 \
+  --depth_evaluation_time_steps '[1,2,4,8,16,32,64]' \
+  --depth_evaluation_exhaustive_x true \
+  --ood_n_depth_evaluation_modulus_bits '[10,11]' \
+  --ood_n_depth_evaluation_examples_per_setting 128 \
+  --train_fraction 0.8 --test_fraction 0.2 \
+  --split_group prompt --seed 45 --separate_input_output true
+
+# E10: final additive rung before the original Easy tail.
+python -m data.squaring_mod \
+  --output_dir data/generated/squaring_mod_granular_easy_e10_bidirectional_fixed_n_403_t123 \
+  --fixed_p 13 --fixed_q 31 \
+  --time_steps '[1,2,3]' --ood_time_steps '[6]' \
+  --examples_per_setting 330 --ood_examples_per_setting 125 \
+  --depth_evaluation_time_steps '[1,2,4,8,16,32,64]' \
+  --depth_evaluation_exhaustive_x true \
+  --ood_n_depth_evaluation_modulus_bits '[10,11]' \
+  --ood_n_depth_evaluation_examples_per_setting 128 \
+  --train_fraction 0.8 --test_fraction 0.2 \
+  --split_group prompt --seed 45 --separate_input_output true
+
 # ---------------------------------------------------------------------------
-# Medium: five datasets using the ten-minute training budget.
+# Medium: ten datasets using the ten-minute training budget.
 # ---------------------------------------------------------------------------
 
 # M1: 14-bit fixed N with a geometric T schedule.
@@ -145,5 +210,70 @@ python -m data.squaring_mod \
   --depth_evaluation_examples_per_setting 256 \
   --ood_n_depth_evaluation_modulus_bits '[13,15,18]' \
   --ood_n_depth_evaluation_examples_per_setting 256 \
+  --train_fraction 0.9 --test_fraction 0.1 \
+  --split_group prompt --seed 45 --separate_input_output true
+
+# M6: easiest new Medium rung; both references remain well below Easy E1.
+python -m data.squaring_mod \
+  --output_dir data/generated/squaring_mod_granular_medium_m6_bidirectional_fixed_n_1517_t124 \
+  --fixed_p 37 --fixed_q 41 \
+  --time_steps '[1,2,4]' --ood_time_steps '[8]' \
+  --examples_per_setting 1300 --ood_examples_per_setting 500 \
+  --depth_evaluation_time_steps '[1,2,4,8,16,32,64]' \
+  --depth_evaluation_exhaustive_x true \
+  --ood_n_depth_evaluation_modulus_bits '[12,13]' \
+  --ood_n_depth_evaluation_examples_per_setting 128 \
+  --train_fraction 0.9 --test_fraction 0.1 \
+  --split_group prompt --seed 45 --separate_input_output true
+
+# M7: second rung, lower on both reference submissions.
+python -m data.squaring_mod \
+  --output_dir data/generated/squaring_mod_granular_medium_m7_bidirectional_fixed_n_1763_t124 \
+  --fixed_p 41 --fixed_q 43 \
+  --time_steps '[1,2,4]' --ood_time_steps '[8]' \
+  --examples_per_setting 1500 --ood_examples_per_setting 600 \
+  --depth_evaluation_time_steps '[1,2,4,8,16,32,64]' \
+  --depth_evaluation_exhaustive_x true \
+  --ood_n_depth_evaluation_modulus_bits '[12,13]' \
+  --ood_n_depth_evaluation_examples_per_setting 128 \
+  --train_fraction 0.9 --test_fraction 0.1 \
+  --split_group prompt --seed 45 --separate_input_output true
+
+# M8: third rung, selected from the broad semiprime probe grid.
+python -m data.squaring_mod \
+  --output_dir data/generated/squaring_mod_granular_medium_m8_bidirectional_fixed_n_1333_t124 \
+  --fixed_p 31 --fixed_q 43 \
+  --time_steps '[1,2,4]' --ood_time_steps '[8]' \
+  --examples_per_setting 1100 --ood_examples_per_setting 425 \
+  --depth_evaluation_time_steps '[1,2,4,8,16,32,64]' \
+  --depth_evaluation_exhaustive_x true \
+  --ood_n_depth_evaluation_modulus_bits '[12,13]' \
+  --ood_n_depth_evaluation_examples_per_setting 128 \
+  --train_fraction 0.9 --test_fraction 0.1 \
+  --split_group prompt --seed 45 --separate_input_output true
+
+# M9: fourth rung, with lower scores from both reference submissions.
+python -m data.squaring_mod \
+  --output_dir data/generated/squaring_mod_granular_medium_m9_bidirectional_fixed_n_1927_t124 \
+  --fixed_p 41 --fixed_q 47 \
+  --time_steps '[1,2,4]' --ood_time_steps '[8]' \
+  --examples_per_setting 1550 --ood_examples_per_setting 600 \
+  --depth_evaluation_time_steps '[1,2,4,8,16,32,64]' \
+  --depth_evaluation_exhaustive_x true \
+  --ood_n_depth_evaluation_modulus_bits '[12,13]' \
+  --ood_n_depth_evaluation_examples_per_setting 128 \
+  --train_fraction 0.9 --test_fraction 0.1 \
+  --split_group prompt --seed 45 --separate_input_output true
+
+# M10: hardest new rung before the original near-zero Medium datasets.
+python -m data.squaring_mod \
+  --output_dir data/generated/squaring_mod_granular_medium_m10_bidirectional_fixed_n_1739_t124 \
+  --fixed_p 37 --fixed_q 47 \
+  --time_steps '[1,2,4]' --ood_time_steps '[8]' \
+  --examples_per_setting 1400 --ood_examples_per_setting 550 \
+  --depth_evaluation_time_steps '[1,2,4,8,16,32,64]' \
+  --depth_evaluation_exhaustive_x true \
+  --ood_n_depth_evaluation_modulus_bits '[12,13]' \
+  --ood_n_depth_evaluation_examples_per_setting 128 \
   --train_fraction 0.9 --test_fraction 0.1 \
   --split_group prompt --seed 45 --separate_input_output true

@@ -158,8 +158,8 @@ The evaluator supplies a padding mask, not a causal mask, so models can attend
 bidirectionally over the complete prompt in those practice tiers. Hard uses a
 private hidden evaluator.
 
-- **Easy:** datasets `e1`–`e5`, 60 training seconds, 60 accepted attempts per UTC day.
-- **Medium:** datasets `m1`–`m5`, 600 training seconds, 6 accepted attempts per UTC day.
+- **Easy:** datasets `e1`–`e10`, 60 training seconds, 60 accepted attempts per UTC day.
+- **Medium:** datasets `m1`–`m10`, 600 training seconds, 6 accepted attempts per UTC day.
 - **Hard:** dataset `h1`, 3,600 training seconds, 1 accepted attempt per UTC day.
 
 Easy and Medium are practice tiers. The public leaderboard ranks only each participant's best successful Hard submission. Failed evaluations count after acceptance; authentication and validation rejections do not. Source and detailed results remain private.
