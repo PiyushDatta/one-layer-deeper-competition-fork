@@ -60,7 +60,7 @@ class ReleaseSurfaceTests(unittest.TestCase):
         public_manifests = sorted(manifest_dir.glob("h100_easy_*.json")) + sorted(
             manifest_dir.glob("h100_medium_*.json")
         )
-        self.assertEqual(len(public_manifests), 10)
+        self.assertEqual(len(public_manifests), 20)
         for manifest_path in public_manifests:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             data_root = manifest["data"]["data_root"]
@@ -70,7 +70,7 @@ class ReleaseSurfaceTests(unittest.TestCase):
         generation_commands = [
             line for line in generator.splitlines() if line.startswith("python -m data.")
         ]
-        self.assertEqual(len(generation_commands), 10)
+        self.assertEqual(len(generation_commands), 20)
         self.assertTrue(
             all(line.startswith("python -m data.squaring_mod") for line in generation_commands)
         )

@@ -30,8 +30,16 @@ class TierCatalogTests(unittest.TestCase):
             [tier.evaluator_timeout_seconds for tier in TIERS],
             [390, 1200, 6120],
         )
+        self.assertEqual(
+            [[dataset.id for dataset in tier.datasets] for tier in TIERS],
+            [
+                ["e6", "e7", "e1", "e8", "e9", "e10", "e2", "e3", "e5", "e4"],
+                ["m6", "m7", "m8", "m9", "m10", "m2", "m3", "m5", "m4", "m1"],
+                ["h1"],
+            ],
+        )
         self.assertEqual([tier.daily_attempts for tier in TIERS], [60, 6, 1])
-        self.assertEqual([len(tier.datasets) for tier in TIERS], [5, 5, 1])
+        self.assertEqual([len(tier.datasets) for tier in TIERS], [10, 10, 1])
 
     def test_remote_allowlist_is_derived_from_the_catalog(self) -> None:
         expected = {
@@ -40,7 +48,7 @@ class TierCatalogTests(unittest.TestCase):
             for dataset in tier.datasets
         }
         self.assertEqual(submission_manifest_timeouts(), expected)
-        self.assertEqual(len(expected), 11)
+        self.assertEqual(len(expected), 21)
 
     def test_modal_image_generation_uses_synced_environment_and_no_network(self) -> None:
         source = (ROOT / "modal_runner.py").read_text(encoding="utf-8")
@@ -64,7 +72,7 @@ class TierCatalogTests(unittest.TestCase):
             if not line.lstrip().startswith("#")
         )
         generation_commands = active_script.split("python -m data.")[1:]
-        self.assertEqual(len(generation_commands), 10)
+        self.assertEqual(len(generation_commands), 20)
         for command in generation_commands:
             with self.subTest(command=command.splitlines()[0]):
                 self.assertIn("--separate_input_output true", command)
