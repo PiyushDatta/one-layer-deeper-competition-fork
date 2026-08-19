@@ -21,9 +21,15 @@ source .venv/bin/activate
 uv sync
 python -m unittest discover -s tests
 ./scripts/generate_datasets.sh
-CUDA_VISIBLE_DEVICES=0 python -m benchmark.runner --manifest benchmark/manifests/h100_easy_e1.json --submission-file submissions/baseline_adamw/submission.py
+CUDA_VISIBLE_DEVICES=0 python -m benchmark.runner --manifest benchmark/manifests/h100_easy_e1.json --submission-file submissions/piydatta_submission/submission.py
 ```
 
+### On windows:
+```
+& "C:\Program Files\Git\bin\bash.exe" ./scripts/generate_datasets.sh
+$env:CUDA_VISIBLE_DEVICES = "0"
+python -m benchmark.runner --manifest benchmark/manifests/h100_easy_e1.json --submission-file submissions/piydatta_submission/submission.py
+```
 ### Example output:
 ```
 (.venv) [/one-layer-deeper-competition-fork (working_branch)]$ CUDA_VISIBLE_DEVICES=0 python -m benchmark.runner \
