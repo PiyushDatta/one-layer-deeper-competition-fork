@@ -757,8 +757,14 @@ def run_submission_file(
     manifest_path: str | Path,
     *,
     include_structured_metrics: bool = False,
+    num_workers: int | None = None,
 ) -> dict:
     manifest = load_manifest(manifest_path)
+    if num_workers is not None:
+        manifest = replace(
+            manifest,
+            data=replace(manifest.data, num_workers=num_workers),
+        )
     device = _resolve_device(manifest)
     model_spec = _make_model_spec(manifest)
     preloaded_dataloaders = {}
@@ -789,6 +795,7 @@ def run_submission_file(
                 "model_spec": asdict(model_spec),
                 "training_batch_size": batch_size,
                 "evaluation_batch_size": eval_batch_size,
+                "num_workers": manifest.data.num_workers,
                 "max_training_steps": min(
                     manifest.runtime.max_steps,
                     submission.max_steps or manifest.runtime.max_steps,
@@ -878,12 +885,18 @@ def cli() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--submission-file", required=True)
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        help="override the manifest data-loader worker count",
+    )
     parser.add_argument("--include-structured-metrics", action="store_true")
     args = parser.parse_args()
     run_submission_file(
         args.submission_file,
         args.manifest,
         include_structured_metrics=args.include_structured_metrics,
+        num_workers=args.num_workers,
     )
 
 

@@ -24,6 +24,7 @@ from benchmark.runner import (
     _scoring_split_names,
     _train,
     _with_batch_size,
+    cli,
 )
 
 
@@ -31,6 +32,29 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class RunnerBudgetTests(unittest.TestCase):
+    def test_cli_passes_num_workers_override(self) -> None:
+        argv = [
+            "benchmark.runner",
+            "--manifest",
+            "manifest.json",
+            "--submission-file",
+            "submission.py",
+            "--num-workers",
+            "0",
+        ]
+        with (
+            patch.object(sys, "argv", argv),
+            patch("benchmark.runner.run_submission_file") as run,
+        ):
+            cli()
+
+        run.assert_called_once_with(
+            "submission.py",
+            "manifest.json",
+            include_structured_metrics=False,
+            num_workers=0,
+        )
+
     def test_official_scoring_split_layouts(self) -> None:
         self.assertEqual(
             _scoring_split_names(
