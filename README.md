@@ -26,6 +26,7 @@ CUDA_VISIBLE_DEVICES=0 python -m benchmark.runner --manifest benchmark/manifests
 
 ### On windows:
 ```
+uv --system-certs pip install --python .venv\Scripts\python.exe --reinstall "torch==2.12.1" --torch-backend=cu130
 & "C:\Program Files\Git\bin\bash.exe" ./scripts/generate_datasets.sh
 $env:CUDA_VISIBLE_DEVICES = "0"
 python -m benchmark.runner --manifest benchmark/manifests/h100_easy_e1.json --submission-file submissions/piydatta_submission/submission.py
