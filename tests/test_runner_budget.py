@@ -23,6 +23,7 @@ from benchmark.runner import (
     _resolve_batch_sizes,
     _run_seed,
     _scoring_split_names,
+    _submission_requests_act_diagnostics,
     _train,
     _with_batch_size,
     cli,
@@ -33,6 +34,25 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class RunnerBudgetTests(unittest.TestCase):
+    def test_submission_debug_constant_requests_act_diagnostics(self) -> None:
+        debug_submission = SimpleNamespace(
+            build_model=SimpleNamespace(__globals__={"DBUG": True})
+        )
+        final_submission = SimpleNamespace(
+            build_model=SimpleNamespace(__globals__={"DBUG": False})
+        )
+        submission_without_debug_constant = SimpleNamespace(
+            build_model=SimpleNamespace(__globals__={})
+        )
+
+        self.assertTrue(_submission_requests_act_diagnostics(debug_submission))
+        self.assertFalse(_submission_requests_act_diagnostics(final_submission))
+        self.assertFalse(
+            _submission_requests_act_diagnostics(
+                submission_without_debug_constant
+            )
+        )
+
     def test_formats_competition_progress_from_worst_seed(self) -> None:
         result = {
             "depth_profile": {

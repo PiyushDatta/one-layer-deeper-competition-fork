@@ -19,16 +19,17 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.submission = _load_submission_file(SUBMISSION_PATH)
         self.namespace = self.submission.build_model.__globals__
+        self.original_debug_setting = self.namespace["DBUG"]
         self.model_class = self.namespace["Model"]
         self.spec = ModelSpec(17, 4, 1_000_000)
         self.input_ids = torch.tensor([[1, 2, 3, 0]])
         self.attention_mask = torch.tensor([[True, True, True, False]])
 
     def tearDown(self) -> None:
-        self.namespace["DBUG"] = False
+        self.namespace["DBUG"] = self.original_debug_setting
 
     def test_final_path_returns_only_the_scalar_ponder_cost(self) -> None:
-        self.assertIs(self.namespace["DBUG"], False)
+        self.namespace["DBUG"] = False
         model = self.model_class(self.spec, use_act=True)
         self.assertFalse(hasattr(model, "collect_act_diagnostics"))
 

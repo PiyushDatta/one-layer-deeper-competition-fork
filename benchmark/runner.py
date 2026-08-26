@@ -1037,6 +1037,16 @@ def _load_submission_file(path: str | Path) -> Submission:
     return submission
 
 
+def _submission_requests_act_diagnostics(submission: Submission) -> bool:
+    """Return whether the submission module has explicitly enabled debug mode."""
+
+    module_globals = getattr(submission.build_model, "__globals__", None)
+    return (
+        isinstance(module_globals, dict)
+        and module_globals.get("DBUG") is True
+    )
+
+
 def run_submission_file(
     submission_path: str | Path,
     manifest_path: str | Path,
@@ -1066,6 +1076,15 @@ def run_submission_file(
     submission_load_started = time.monotonic()
     submission = _load_submission_file(submission_path)
     validate_submission(submission)
+    submission_debug_enabled = _submission_requests_act_diagnostics(submission)
+    if submission_debug_enabled and not include_act_diagnostics:
+        print(
+            "ACT_DIAGNOSTICS_ENABLED | submission DBUG=True",
+            flush=True,
+        )
+    include_act_diagnostics = (
+        include_act_diagnostics or submission_debug_enabled
+    )
     submission_load_seconds = time.monotonic() - submission_load_started
     budget_per_seed = manifest.runtime.total_training_time_seconds / len(
         manifest.runtime.seeds

@@ -231,10 +231,10 @@ One run was reported as ACT max 12, but its model state (`202,880`), optimizer s
 
 ## ACT diagnostics
 
-For a local diagnostic run, temporarily set `DBUG = True` in `submission.py` and add `--include-act-diagnostics`. Restore `DBUG = False` before making a competition submission; the false path creates no diagnostic dictionaries or cap masks.
+For a local diagnostic run, temporarily set `DBUG = True` in `submission.py`. The runner detects that constant and automatically performs the separate ACT diagnostic pass. Restore `DBUG = False` before making a competition submission; the false path creates no diagnostic dictionaries or cap masks. The older `--include-act-diagnostics` option remains available as an explicit override, but it is not needed for this submission.
 
 ```powershell
-python -m benchmark.runner --manifest benchmark/manifests/h100_easy_e1.json --submission-file submissions/piydatta_submission/submission.py --num-workers 0 --include-act-diagnostics
+python -m benchmark.runner --manifest benchmark/manifests/h100_easy_e1.json --submission-file submissions/piydatta_submission/submission.py --num-workers 0
 ```
 
 - pure task cross-entropy, excluding ponder penalty;
@@ -254,7 +254,7 @@ Wall-clock time is controlled by the slowest active token in a dense-attention b
 
 ## Recommended next experiments
 
-1. Temporarily enable both `DBUG = True` and `--include-act-diagnostics` on future ACT analysis runs, then restore `DBUG = False` before submission.
+1. Temporarily set `DBUG = True` for future ACT analysis runs; diagnostics are collected automatically. Restore `DBUG = False` before submission.
 2. At max 12, compare ponder weights around the promising `0.1` value, such as `0.03`, `0.05`, `0.15`, and `0.2`.
 3. Compare the explicitly labeled evaluation task cross-entropy across ponder weights.
 4. Repeat the strongest configurations on additional manifests or seeds before treating one- or two-example differences as reliable.
