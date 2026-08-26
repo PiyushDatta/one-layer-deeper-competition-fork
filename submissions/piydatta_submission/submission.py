@@ -15,8 +15,11 @@ D_MODEL = 128
 NUM_HEADS = 4
 PONDER_WEIGHT = 0.001
 USE_ACT = True
-FIXED_LOOPS = 7
-ACT_MAX_LOOPS = 12
+FIXED_LOOPS = 16
+ACT_MAX_LOOPS = 16
+print(
+    f"Constants\n D_MODEL: {D_MODEL}, NUM_HEADS: {NUM_HEADS}, PONDER_WEIGHT: {PONDER_WEIGHT}, USE_ACT: {USE_ACT}, FIXED_LOOPS: {FIXED_LOOPS}, ACT_MAX_LOOPS: {ACT_MAX_LOOPS}"
+)
 
 
 def training_loss(
@@ -83,20 +86,24 @@ class Model(nn.Module):
         self.config = Config(spec.vocab_size, spec.max_seq_len)
         self.use_act = use_act
         self.max_loops = ACT_MAX_LOOPS if self.use_act else FIXED_LOOPS
+        self.halting_prob_threshold = 0.01
+
         self.token_embedding = nn.Embedding(spec.vocab_size, D_MODEL)
         self.position_embedding = nn.Embedding(spec.max_seq_len, D_MODEL)
-        self.time_embedding = nn.Embedding(self.max_loops, D_MODEL)
-        if self.use_act:
-            self.halting_unit = nn.Linear(D_MODEL, 1)
-        self.halting_prob_threshold = 0.01
-        init_std = 0.02
-        nn.init.normal_(self.token_embedding.weight, std=init_std)
-        nn.init.normal_(self.position_embedding.weight, std=init_std)
-        nn.init.normal_(self.time_embedding.weight, std=init_std)
         self.block = Block()
         self.final_norm = RMSNorm(D_MODEL)
         self.head = nn.Linear(D_MODEL, spec.vocab_size, bias=False)
         self.head.weight = self.token_embedding.weight
+
+        init_std = 0.02
+        nn.init.normal_(self.token_embedding.weight, std=init_std)
+        nn.init.normal_(self.position_embedding.weight, std=init_std)
+
+        self.time_embedding = nn.Embedding(self.max_loops, D_MODEL)
+        nn.init.normal_(self.time_embedding.weight, std=init_std)
+
+        if self.use_act:
+            self.halting_unit = nn.Linear(D_MODEL, 1)
 
     def forward(
         self,
