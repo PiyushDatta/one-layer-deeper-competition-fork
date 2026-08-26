@@ -19,6 +19,7 @@ from data.squaring_mod import generate_squaring_mod_smoke_dataset
 from benchmark.runner import (
     _evaluate,
     _depth_split_names,
+    _format_competition_progress,
     _resolve_batch_sizes,
     _run_seed,
     _scoring_split_names,
@@ -32,6 +33,84 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class RunnerBudgetTests(unittest.TestCase):
+    def test_formats_competition_progress_from_worst_seed(self) -> None:
+        result = {
+            "depth_profile": {
+                "ladder": [1, 2, 4, 8, 16, 32, 64],
+                "max_certified_time_steps": None,
+                "ood_n_ladder": [1, 2, 4, 8, 16, 32, 64],
+                "ood_n_max_certified_time_steps": None,
+            },
+            "seeds": [
+                {
+                    "depth_profile": {
+                        "rungs": [
+                            {
+                                "time_steps": 1,
+                                "correct_examples": 1,
+                                "example_count": 38,
+                                "exact_accuracy": 1 / 38,
+                            }
+                        ],
+                        "ood_n_rungs": [
+                            {
+                                "time_steps": 1,
+                                "correct_examples": 3,
+                                "example_count": 512,
+                                "exact_accuracy": 3 / 512,
+                            }
+                        ],
+                    }
+                },
+                {
+                    "depth_profile": {
+                        "rungs": [
+                            {
+                                "time_steps": 1,
+                                "correct_examples": 2,
+                                "example_count": 38,
+                                "exact_accuracy": 2 / 38,
+                            }
+                        ],
+                        "ood_n_rungs": [
+                            {
+                                "time_steps": 1,
+                                "correct_examples": 4,
+                                "example_count": 512,
+                                "exact_accuracy": 4 / 512,
+                            }
+                        ],
+                    }
+                },
+            ],
+        }
+
+        self.assertEqual(
+            _format_competition_progress(result),
+            "COMPETITION_PROGRESS | "
+            "ID: MaxT=None, Next=T=1, Acc=2.6316% (1/38) | "
+            "OOD N: MaxT=None, Next=T=1, Acc=0.5859% (3/512)",
+        )
+
+    def test_formats_fully_certified_and_missing_ood_profile(self) -> None:
+        result = {
+            "depth_profile": {
+                "ladder": [1, 2, 4, 8, 16, 32, 64],
+                "max_certified_time_steps": 64,
+                "ood_n_ladder": [],
+                "ood_n_max_certified_time_steps": None,
+            },
+            "seeds": [],
+        }
+
+        self.assertEqual(
+            _format_competition_progress(result),
+            "COMPETITION_PROGRESS | ID: MaxT=64, Certified | OOD N: N/A",
+        )
+
+    def test_omits_competition_progress_without_a_depth_profile(self) -> None:
+        self.assertIsNone(_format_competition_progress({"seeds": []}))
+
     def test_cli_passes_num_workers_override(self) -> None:
         argv = [
             "benchmark.runner",

@@ -82,6 +82,99 @@ def _depth_split_names(
     )
 
 
+def _format_profile_progress(
+    result: dict,
+    *,
+    label: str,
+    ladder_key: str,
+    max_t_key: str,
+    rungs_key: str,
+) -> str:
+    profile = result["depth_profile"]
+    ladder = [int(time_steps) for time_steps in profile.get(ladder_key, ())]
+    if not ladder:
+        return f"{label}: N/A"
+
+    max_t = profile.get(max_t_key)
+    certified_t = int(max_t) if max_t is not None else 0
+    max_t_text = str(certified_t) if certified_t else "None"
+    next_t = next(
+        (time_steps for time_steps in ladder if time_steps > certified_t),
+        None,
+    )
+    if next_t is None:
+        return f"{label}: MaxT={max_t_text}, Certified"
+
+    measurements = []
+    seed_results = result.get("seeds", ())
+    for seed_result in seed_results:
+        seed_profile = seed_result.get("depth_profile") or {}
+        rung = next(
+            (
+                item
+                for item in seed_profile.get(rungs_key, ())
+                if int(item["time_steps"]) == next_t
+            ),
+            None,
+        )
+        if rung is None:
+            return (
+                f"{label}: MaxT={max_t_text}, Next=T={next_t}, "
+                "Acc=unavailable"
+            )
+        correct = rung.get("correct_examples")
+        total = rung.get("example_count")
+        if correct is not None and total:
+            accuracy = int(correct) / int(total)
+        else:
+            exact_accuracy = rung.get("exact_accuracy")
+            if exact_accuracy is None:
+                return (
+                    f"{label}: MaxT={max_t_text}, Next=T={next_t}, "
+                    "Acc=unavailable"
+                )
+            accuracy = float(exact_accuracy)
+        measurements.append((accuracy, correct, total))
+
+    if not measurements:
+        return (
+            f"{label}: MaxT={max_t_text}, Next=T={next_t}, "
+            "Acc=unavailable"
+        )
+
+    accuracy, correct, total = min(measurements, key=lambda item: item[0])
+    count_text = (
+        f" ({int(correct)}/{int(total)})"
+        if correct is not None and total
+        else ""
+    )
+    return (
+        f"{label}: MaxT={max_t_text}, Next=T={next_t}, "
+        f"Acc={100.0 * accuracy:.4f}%{count_text}"
+    )
+
+
+def _format_competition_progress(result: dict) -> str | None:
+    profile = result.get("depth_profile")
+    if not profile or not profile.get("ladder"):
+        return None
+    id_progress = _format_profile_progress(
+        result,
+        label="ID",
+        ladder_key="ladder",
+        max_t_key="max_certified_time_steps",
+        rungs_key="rungs",
+    )
+    ood_progress = _format_profile_progress(
+        result,
+        label="OOD N",
+        ladder_key="ood_n_ladder",
+        max_t_key="ood_n_max_certified_time_steps",
+        rungs_key="ood_n_rungs",
+    )
+    return f"COMPETITION_PROGRESS | {id_progress} | {ood_progress}"
+
+
 def _deny_dataset_file_access(data_root: str | Path) -> None:
     """Prevent uploaded code from reopening evaluator-owned dataset files."""
 
@@ -878,6 +971,9 @@ def run_submission_file(
         )
         result["structured_metrics"] = metric_recorder.snapshot()
     print("RESULT_JSON=" + json.dumps(result, sort_keys=True), flush=True)
+    competition_progress = _format_competition_progress(result)
+    if competition_progress is not None:
+        print("\n" + competition_progress, flush=True)
     return result
 
 
