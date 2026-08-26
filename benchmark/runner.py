@@ -25,6 +25,7 @@ from data import (
     infer_vocab_size,
     make_dataloaders,
 )
+from .act_diagnostics import ActDiagnosticsAccumulator
 from .api import (
     BackwardPassContext,
     BatchReuseContext,
@@ -175,6 +176,90 @@ def _format_competition_progress(result: dict) -> str | None:
     return f"COMPETITION_PROGRESS | {id_progress} | {ood_progress}"
 
 
+def _format_act_diagnostics(result: dict) -> str | None:
+    """Format local ACT telemetry without changing official score fields."""
+
+    lines = []
+    for seed_result in result.get("seeds", ()):
+        seed = seed_result["seed"]
+        payload = seed_result.get("act_diagnostics") or {}
+        metric_groups = list(payload.get("scoring_splits", {}).items())
+        metric_groups.extend(
+            (f"{label}/T={rung['time_steps']}", rung["diagnostics"])
+            for label, rung in payload.get(
+                "first_uncertified_depth_rungs", {}
+            ).items()
+        )
+        for split, diagnostics in metric_groups:
+            updates = diagnostics["token_update_counts"]
+            global_loops = diagnostics["global_iterations_per_batch"]
+            caps = diagnostics["cap_hits"]
+            remainders = diagnostics["remainders"]
+            forced_remainder = remainders["mean_cap_forced"]
+            forced_remainder_text = (
+                "N/A" if forced_remainder is None else f"{forced_remainder:.3f}"
+            )
+            lines.append(
+                f"ACT_SUMMARY | seed={seed} split={split} | "
+                f"eval_task_CE="
+                f"{diagnostics['evaluation_task_cross_entropy']:.6f} | "
+                f"ponder={diagnostics['raw_mean_ponder_time']:.3f} | "
+                f"weighted_ponder={diagnostics['weighted_ponder_contribution']:.6f} | "
+                f"updates mean/median/p90/p95/p99/max="
+                f"{updates['mean']:.3f}/{updates['median']:.3f}/"
+                f"{updates['p90']:.0f}/{updates['p95']:.0f}/"
+                f"{updates['p99']:.0f}/{updates['maximum']:.0f} | "
+                f"global_loops mean/max="
+                f"{global_loops['mean']:.3f}/{global_loops['maximum']:.0f} | "
+                f"cap_reached token/batch="
+                f"{100.0 * caps['token_reached_cap_rate']:.2f}%/"
+                f"{100.0 * caps['batch_reached_cap_rate']:.2f}% | "
+                f"cap_forced token/batch="
+                f"{100.0 * caps['token_forced_cap_rate']:.2f}%/"
+                f"{100.0 * caps['batch_forced_cap_rate']:.2f}% | "
+                f"remainder mean/forced="
+                f"{remainders['mean']:.3f}/{forced_remainder_text}"
+            )
+            endings = " ".join(
+                f"{item['iteration']}:"
+                f"{item['ended_at_percentage']:.1f}%/"
+                f"{item['ended_by_percentage']:.1f}%"
+                for item in diagnostics["iteration_end_percentages"]
+            )
+            if diagnostics["iteration_detail_truncated"]:
+                endings += (
+                    " ... "
+                    f"{diagnostics['iteration_detail_unreported_token_percentage']:.1f}% "
+                    "of tokens ended after the detail limit"
+                )
+            lines.append(
+                f"ACT_PROCESSING_ENDED_AT/BY | seed={seed} split={split} | "
+                f"{endings}"
+            )
+            correctness = diagnostics["by_correctness"]
+            lines.append(
+                f"ACT_BY_CORRECTNESS | seed={seed} split={split} | "
+                + " | ".join(
+                    f"{label}: n={group['example_count']}, "
+                    f"updates={group['mean_updates_per_example']:.3f}"
+                    if group["mean_updates_per_example"] is not None
+                    else f"{label}: n=0, updates=N/A"
+                    for label, group in correctness.items()
+                )
+            )
+            by_length = diagnostics["by_sequence_length"]
+            lines.append(
+                f"ACT_BY_INPUT_LENGTH | seed={seed} split={split} | "
+                + " | ".join(
+                    f"L={length}: n={group['example_count']}, "
+                    f"acc={100.0 * group['exact_accuracy']:.2f}%, "
+                    f"updates={group['mean_updates_per_example']:.3f}"
+                    for length, group in by_length.items()
+                )
+            )
+    return "\n".join(lines) if lines else None
+
+
 def _deny_dataset_file_access(data_root: str | Path) -> None:
     """Prevent uploaded code from reopening evaluator-owned dataset files."""
 
@@ -317,6 +402,7 @@ def _loss_and_accuracy(
     *,
     training_loss=None,
     token_training_loss=None,
+    act_diagnostics: ActDiagnosticsAccumulator | None = None,
 ) -> tuple[torch.Tensor, float, int, int]:
     input_ids, targets, attention_mask, target_positions = prepare_batch(
         batch,
@@ -385,9 +471,15 @@ def _loss_and_accuracy(
 
         token_predictions = token_logits.argmax(dim=-1)
         rows_with_targets = valid.any(dim=1)
-        exact_rows = (
-            (token_predictions == token_targets) | ~valid
-        ).all(dim=1)[rows_with_targets]
+        exact_rows = ((token_predictions == token_targets) | ~valid).all(dim=1)
+        if act_diagnostics is not None:
+            act_diagnostics.add(
+                auxiliary=auxiliary,
+                attention_mask=attention_mask,
+                exact_rows=exact_rows,
+                rows_with_targets=rows_with_targets,
+            )
+        exact_rows = exact_rows[rows_with_targets]
         example_count = int(rows_with_targets.sum().item())
         loss_weight = int(valid.sum().item())
 
@@ -549,13 +641,17 @@ def _evaluate(
     *,
     deadline: float,
     budget_seconds: float,
-) -> dict[str, float]:
+    include_act_diagnostics: bool = False,
+) -> dict:
     model.eval()
     versions = capture_state_versions(model)
     loss_sum = 0.0
     correct_sum = 0.0
     example_count = 0
     loss_count = 0
+    act_diagnostics = (
+        ActDiagnosticsAccumulator() if include_act_diagnostics else None
+    )
     with torch.no_grad():
         for batch in dataloader:
             if time.monotonic() >= deadline:
@@ -563,7 +659,11 @@ def _evaluate(
                     f"evaluation exhausted its {budget_seconds:.1f}s time budget"
                 )
             loss, accuracy, batch_examples, batch_loss_weight = _loss_and_accuracy(
-                model, batch, manifest, device
+                model,
+                batch,
+                manifest,
+                device,
+                act_diagnostics=act_diagnostics,
             )
             if time.monotonic() >= deadline:
                 raise TimeoutError(
@@ -582,12 +682,17 @@ def _evaluate(
     if example_count == 0 or loss_count == 0:
         raise ValueError("evaluation split contains no labels")
     accuracy = correct_sum / example_count
-    return {
+    metrics = {
         "loss": loss_sum / loss_count,
         "exact_accuracy": accuracy,
         "correct_examples": int(round(correct_sum)),
         "example_count": example_count,
     }
+    if act_diagnostics is not None:
+        metrics["act_diagnostics"] = act_diagnostics.summary(
+            evaluation_task_cross_entropy=metrics["loss"]
+        )
+    return metrics
 
 
 
@@ -671,6 +776,7 @@ def _run_seed(
     submission_load_seconds: float,
     dataloaders=None,
     metric_recorder: MetricRecorder | None = None,
+    include_act_diagnostics: bool = False,
 ) -> dict:
     _configure_seed(seed, device)
     batch_size, eval_batch_size = _resolve_batch_sizes(submission, manifest)
@@ -807,7 +913,89 @@ def _run_seed(
     )
     evaluation_seconds = time.monotonic() - evaluation_started_at
 
-    return {
+    act_diagnostics_seconds = None
+    act_diagnostics_result = None
+    if include_act_diagnostics and hasattr(model, "collect_act_diagnostics"):
+        diagnostics_started_at = time.monotonic()
+        act_diagnostics_result = {
+            "scoring_splits": {},
+            "first_uncertified_depth_rungs": {},
+        }
+        previous_diagnostics_setting = getattr(
+            model, "collect_act_diagnostics", None
+        )
+        model.collect_act_diagnostics = True
+
+        def collect_act(dataloader) -> dict | None:
+            local_metrics = _evaluate(
+                model,
+                dataloader,
+                manifest,
+                device,
+                deadline=float("inf"),
+                budget_seconds=float("inf"),
+                include_act_diagnostics=True,
+            )
+            return local_metrics.get("act_diagnostics")
+
+        try:
+            for split_name in _scoring_split_names(dataloaders):
+                diagnostics = collect_act(dataloaders[split_name])
+                if diagnostics is not None:
+                    act_diagnostics_result["scoring_splits"][
+                        split_name
+                    ] = diagnostics
+
+            def attach_first_uncertified(
+                profile: dict,
+                *,
+                label: str,
+                split_prefix: str,
+            ) -> None:
+                certified = profile["max_certified_time_steps"] or 0
+                rung = next(
+                    (
+                        item
+                        for item in profile["rungs"]
+                        if item["time_steps"] > certified
+                        and item["status"] != "not_completed"
+                    ),
+                    None,
+                )
+                if rung is None:
+                    return
+                split_name = f"{split_prefix}{rung['time_steps']}"
+                diagnostics = collect_act(dataloaders[split_name])
+                if diagnostics is not None:
+                    depth_diagnostics = act_diagnostics_result[
+                        "first_uncertified_depth_rungs"
+                    ]
+                    depth_diagnostics[label] = {
+                        "time_steps": rung["time_steps"],
+                        "diagnostics": diagnostics,
+                    }
+
+            attach_first_uncertified(
+                depth_profile,
+                label="seen_n",
+                split_prefix=DEPTH_SPLIT_PREFIX,
+            )
+            attach_first_uncertified(
+                ood_n_depth_profile,
+                label="ood_n",
+                split_prefix=OOD_N_DEPTH_SPLIT_PREFIX,
+            )
+        finally:
+            model.collect_act_diagnostics = previous_diagnostics_setting
+        act_diagnostics_seconds = time.monotonic() - diagnostics_started_at
+    elif include_act_diagnostics:
+        print(
+            "ACT_DIAGNOSTICS_UNAVAILABLE | submission debug telemetry is "
+            "disabled; set DBUG=True in the submission",
+            flush=True,
+        )
+
+    result = {
         "seed": seed,
         "model_state_elements": state_elements,
         "optimizer_state_elements_after_first_step": optimizer_state_elements,
@@ -822,6 +1010,10 @@ def _run_seed(
         "evaluation": evaluation,
         "depth_profile": depth_profile,
     }
+    if act_diagnostics_seconds is not None:
+        result["act_diagnostics_seconds"] = act_diagnostics_seconds
+        result["act_diagnostics"] = act_diagnostics_result
+    return result
 
 
 def _load_submission_file(path: str | Path) -> Submission:
@@ -850,6 +1042,7 @@ def run_submission_file(
     manifest_path: str | Path,
     *,
     include_structured_metrics: bool = False,
+    include_act_diagnostics: bool = False,
     num_workers: int | None = None,
 ) -> dict:
     manifest = load_manifest(manifest_path)
@@ -914,6 +1107,7 @@ def run_submission_file(
             submission_load_seconds / len(manifest.runtime.seeds),
             preloaded_dataloaders.get(seed),
             metric_recorder,
+            include_act_diagnostics,
         )
         for seed in manifest.runtime.seeds
     ]
@@ -971,6 +1165,9 @@ def run_submission_file(
         )
         result["structured_metrics"] = metric_recorder.snapshot()
     print("RESULT_JSON=" + json.dumps(result, sort_keys=True), flush=True)
+    act_diagnostics = _format_act_diagnostics(result)
+    if act_diagnostics is not None:
+        print("\n" + act_diagnostics, flush=True)
     competition_progress = _format_competition_progress(result)
     if competition_progress is not None:
         print("\n" + competition_progress, flush=True)
@@ -987,11 +1184,17 @@ def cli() -> None:
         help="override the manifest data-loader worker count",
     )
     parser.add_argument("--include-structured-metrics", action="store_true")
+    parser.add_argument(
+        "--include-act-diagnostics",
+        action="store_true",
+        help="collect local ACT telemetry during final test/OOD evaluation",
+    )
     args = parser.parse_args()
     run_submission_file(
         args.submission_file,
         args.manifest,
         include_structured_metrics=args.include_structured_metrics,
+        include_act_diagnostics=args.include_act_diagnostics,
         num_workers=args.num_workers,
     )
 

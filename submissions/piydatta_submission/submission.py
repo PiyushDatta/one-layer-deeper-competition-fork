@@ -17,17 +17,20 @@ PONDER_WEIGHT = 0.001
 USE_ACT = True
 FIXED_LOOPS = 16
 ACT_MAX_LOOPS = 16
-print(
-    f"Constants\n D_MODEL: {D_MODEL}, NUM_HEADS: {NUM_HEADS}, PONDER_WEIGHT: {PONDER_WEIGHT}, USE_ACT: {USE_ACT}, FIXED_LOOPS: {FIXED_LOOPS}, ACT_MAX_LOOPS: {ACT_MAX_LOOPS}"
-)
+DBUG = False
+if DBUG:
+    print(
+        f"Constants\n D_MODEL: {D_MODEL}, NUM_HEADS: {NUM_HEADS}, PONDER_WEIGHT: {PONDER_WEIGHT}, USE_ACT: {USE_ACT}, FIXED_LOOPS: {FIXED_LOOPS}, ACT_MAX_LOOPS: {ACT_MAX_LOOPS}, DBUG: {DBUG}"
+    )
 
 
 def training_loss(
     logits: Tensor,
     labels: Tensor,
-    ponder_cost: Tensor,
+    auxiliary: object,
 ) -> Tensor:
     task_loss = F.cross_entropy(logits, labels)
+    ponder_cost = auxiliary["ponder_cost"] if DBUG else auxiliary
     return task_loss + PONDER_WEIGHT * ponder_cost
 
 
@@ -87,6 +90,8 @@ class Model(nn.Module):
         self.use_act = use_act
         self.max_loops = ACT_MAX_LOOPS if self.use_act else FIXED_LOOPS
         self.halting_prob_threshold = 0.01
+        if DBUG:
+            self.collect_act_diagnostics = False
 
         self.token_embedding = nn.Embedding(spec.vocab_size, D_MODEL)
         self.position_embedding = nn.Embedding(spec.max_seq_len, D_MODEL)
@@ -109,7 +114,7 @@ class Model(nn.Module):
         self,
         input_ids: Tensor,
         attention_mask: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, object]:
         """
         for ACT:
             determine which tokens were running
@@ -131,7 +136,7 @@ class Model(nn.Module):
         self,
         input_ids: Tensor,
         attention_mask: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, object]:
         """
         for ACT:
             determine which tokens were running
@@ -152,6 +157,12 @@ class Model(nn.Module):
         curr_halt_prob = x.new_zeros(batch_size, seq_len, 1)
         update_counts = torch.zeros_like(curr_halt_prob)
         remainders = torch.zeros_like(curr_halt_prob)
+        if DBUG:
+            cap_forced_mask = None
+            if self.collect_act_diagnostics:
+                cap_forced_mask = torch.zeros_like(
+                    curr_halt_prob, dtype=torch.bool
+                )
         weighted_output = torch.zeros_like(x)
         threshold = 1.0 - self.halting_prob_threshold
         if attention_mask is None:
@@ -168,9 +179,16 @@ class Model(nn.Module):
             halting_logit = self.halting_unit(x)
             h = torch.sigmoid(halting_logit)
             if step == self.max_loops - 1:
+                if DBUG and cap_forced_mask is not None:
+                    naturally_halted = was_running & (
+                        curr_halt_prob + h >= threshold
+                    )
+                    cap_forced_mask = was_running & ~naturally_halted
                 newly_halted = was_running
             else:
-                newly_halted = was_running & (curr_halt_prob + h >= threshold)
+                newly_halted = was_running & (
+                    curr_halt_prob + h >= threshold
+                )
             still_running = was_running & ~newly_halted
             update_counts = update_counts + was_running.to(dtype=x.dtype)
             remainder = 1.0 - curr_halt_prob
@@ -187,13 +205,31 @@ class Model(nn.Module):
 
         ponder_time = update_counts + remainders
         ponder_cost = ponder_time[valid_tokens].mean()
-        return self.head(self.final_norm(weighted_output)), ponder_cost
+        logits = self.head(self.final_norm(weighted_output))
+        if not DBUG:
+            return logits, ponder_cost
+
+        act_diagnostics = None
+        if cap_forced_mask is not None:
+            act_diagnostics = {
+                "update_counts": update_counts.squeeze(-1).detach(),
+                "remainders": remainders.squeeze(-1).detach(),
+                "cap_forced_mask": cap_forced_mask.squeeze(-1).detach(),
+                "max_loops": self.max_loops,
+                "global_iterations": step + 1,
+                "ponder_weight": PONDER_WEIGHT,
+            }
+        auxiliary = {
+            "ponder_cost": ponder_cost,
+            "act": act_diagnostics,
+        }
+        return logits, auxiliary
 
     def forward_fixed(
         self,
         input_ids: Tensor,
         attention_mask: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, object]:
         positions = torch.arange(input_ids.shape[1], device=input_ids.device)
         x = self.token_embedding(input_ids)
         pos_signal = self.position_embedding(positions)
@@ -203,7 +239,15 @@ class Model(nn.Module):
             x = self.block(x, attention_mask)
 
         ponder_cost = x.new_zeros(())
-        return self.head(self.final_norm(x)), ponder_cost
+        logits = self.head(self.final_norm(x))
+        if not DBUG:
+            return logits, ponder_cost
+
+        auxiliary = {
+            "ponder_cost": ponder_cost,
+            "act": None,
+        }
+        return logits, auxiliary
 
 
 def build_model(spec: ModelSpec) -> Model:

@@ -131,7 +131,31 @@ class RunnerBudgetTests(unittest.TestCase):
             "submission.py",
             "manifest.json",
             include_structured_metrics=False,
+            include_act_diagnostics=False,
             num_workers=0,
+        )
+
+    def test_cli_enables_local_act_diagnostics(self) -> None:
+        argv = [
+            "benchmark.runner",
+            "--manifest",
+            "manifest.json",
+            "--submission-file",
+            "submission.py",
+            "--include-act-diagnostics",
+        ]
+        with (
+            patch.object(sys, "argv", argv),
+            patch("benchmark.runner.run_submission_file") as run,
+        ):
+            cli()
+
+        run.assert_called_once_with(
+            "submission.py",
+            "manifest.json",
+            include_structured_metrics=False,
+            include_act_diagnostics=True,
+            num_workers=None,
         )
 
     def test_official_scoring_split_layouts(self) -> None:
@@ -458,6 +482,108 @@ class RunnerBudgetTests(unittest.TestCase):
             ],
             ["certified", "failed", "passed_uncertified", "passed_uncertified"],
         )
+
+    def test_act_diagnostics_run_after_scoring_on_a_separate_pass(self) -> None:
+        manifest = load_manifest(ROOT / "benchmark" / "manifests" / "smoke_cpu.json")
+        model_spec = ModelSpec(1, 1, 2)
+
+        def build_model(spec):
+            model = torch.nn.Linear(1, 1)
+            model.config = SimpleNamespace(
+                vocab_size=spec.vocab_size,
+                max_seq_len=spec.max_seq_len,
+            )
+            model.collect_act_diagnostics = False
+            return model
+
+        submission = Submission(
+            build_model=build_model,
+            build_optimizer=lambda model, spec: OptimizerBundle(
+                torch.optim.SGD(model.parameters(), lr=0.1)
+            ),
+        )
+        dataloaders = {
+            "train": object(),
+            "test": object(),
+            "depth_t_1": object(),
+            "depth_ood_n_t_1": object(),
+        }
+        scoring_metrics = {
+            "loss": 1.0,
+            "exact_accuracy": 0.5,
+            "correct_examples": 2,
+            "example_count": 4,
+        }
+
+        def failed_profile():
+            return {
+                "ladder": [1],
+                "max_certified_time_steps": None,
+                "rungs": [
+                    {
+                        "time_steps": 1,
+                        "status": "failed",
+                        "correct_examples": 0,
+                        "example_count": 4,
+                        "exact_accuracy": 0.0,
+                    }
+                ],
+            }
+
+        diagnostics = [
+            {"act_diagnostics": {"marker": "test"}},
+            {"act_diagnostics": {"marker": "seen_n/T=1"}},
+            {"act_diagnostics": {"marker": "ood_n/T=1"}},
+        ]
+        with (
+            patch("benchmark.runner._train", return_value=(0.0, 1, 1.0, 0)),
+            patch(
+                "benchmark.runner._evaluate_depth_profile",
+                side_effect=(failed_profile(), failed_profile()),
+            ),
+            patch(
+                "benchmark.runner._evaluate",
+                side_effect=(scoring_metrics, *diagnostics),
+            ) as evaluate,
+        ):
+            result = _run_seed(
+                submission,
+                manifest,
+                model_spec,
+                torch.device("cpu"),
+                seed=74,
+                budget_seconds=10.0,
+                submission_load_seconds=0.0,
+                dataloaders=dataloaders,
+                include_act_diagnostics=True,
+            )
+
+        self.assertEqual(evaluate.call_count, 4)
+        self.assertFalse(
+            evaluate.call_args_list[0].kwargs.get(
+                "include_act_diagnostics", False
+            )
+        )
+        for call in evaluate.call_args_list[1:]:
+            self.assertTrue(call.kwargs["include_act_diagnostics"])
+            self.assertEqual(call.kwargs["deadline"], float("inf"))
+        self.assertEqual(
+            result["act_diagnostics"]["scoring_splits"]["test"]["marker"],
+            "test",
+        )
+        self.assertEqual(
+            result["act_diagnostics"]["first_uncertified_depth_rungs"][
+                "seen_n"
+            ]["diagnostics"]["marker"],
+            "seen_n/T=1",
+        )
+        self.assertEqual(
+            result["act_diagnostics"]["first_uncertified_depth_rungs"][
+                "ood_n"
+            ]["diagnostics"]["marker"],
+            "ood_n/T=1",
+        )
+        self.assertIn("act_diagnostics_seconds", result)
 
     def test_multi_pass_updates_and_bounded_batch_reuse(self) -> None:
         class CountingSGD(torch.optim.SGD):

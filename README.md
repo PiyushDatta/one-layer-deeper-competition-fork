@@ -31,6 +31,21 @@ uv --system-certs pip install --python .venv\Scripts\python.exe --reinstall "tor
 $env:CUDA_VISIBLE_DEVICES = "0"
 python -m benchmark.runner --manifest benchmark/manifests/h100_easy_e1.json --submission-file submissions/piydatta_submission/submission.py --num-workers 0
 ```
+
+Temporarily set `DBUG = True` in the piydatta submission and add
+`--include-act-diagnostics` to a local run to collect final-model ACT telemetry
+for each scored split. Keep `DBUG = False` for competition submissions; that
+path creates no diagnostic dictionaries or cap masks, and the runner skips its
+diagnostic pass. The optional report
+includes pure evaluation cross-entropy, raw and weighted ponder cost, token and
+batch update distributions, reached/forced cap rates, remainders, per-step
+processing-end percentages, correctness groups, and input-length groups. It
+also diagnoses the first uncertified ID and OOD-N depth rungs in a second,
+non-scoring pass, so telemetry cannot consume the official evaluation deadline
+or change competition progress. The flag is off by default and is not used by
+the hosted evaluator. Update-count medians use the conventional midpoint for
+even samples; p90/p95/p99 use discrete nearest-rank quantiles.
+
 ### Example output:
 ```
 (.venv) [/one-layer-deeper-competition-fork (working_branch)]$ CUDA_VISIBLE_DEVICES=0 python -m benchmark.runner \
