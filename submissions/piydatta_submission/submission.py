@@ -13,7 +13,7 @@ from torch import nn, Tensor
 
 D_MODEL = 128
 NUM_HEADS = 4
-PONDER_WEIGHT = 0.001
+PONDER_WEIGHT = 0.005
 USE_ACT = True
 FIXED_LOOPS = 16
 ACT_MAX_LOOPS = 16
