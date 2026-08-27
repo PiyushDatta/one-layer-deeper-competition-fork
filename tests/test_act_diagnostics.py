@@ -17,17 +17,56 @@ class ActDiagnosticsAccumulatorTests(unittest.TestCase):
         *,
         global_iterations: int,
         max_loops: int = 20,
+        tail_forced_mask: torch.Tensor | None = None,
+        tail_halt_fraction: float | None = None,
     ) -> dict:
-        return {
-            "act": {
-                "update_counts": update_counts,
-                "remainders": remainders,
-                "cap_forced_mask": cap_forced_mask,
-                "max_loops": max_loops,
-                "global_iterations": global_iterations,
-                "ponder_weight": 0.01,
-            }
+        act = {
+            "update_counts": update_counts,
+            "remainders": remainders,
+            "cap_forced_mask": cap_forced_mask,
+            "max_loops": max_loops,
+            "global_iterations": global_iterations,
+            "ponder_weight": 0.01,
         }
+        if tail_forced_mask is not None:
+            act["tail_forced_mask"] = tail_forced_mask
+        if tail_halt_fraction is not None:
+            act["tail_halt_fraction"] = tail_halt_fraction
+        return {"act": act}
+
+    def test_reports_tail_forcing_separately_from_cap_forcing(self) -> None:
+        accumulator = ActDiagnosticsAccumulator()
+        accumulator.add(
+            auxiliary=self._auxiliary(
+                torch.tensor([[2.0, 2.0, 3.0, 20.0]]),
+                torch.tensor([[0.1, 0.4, 0.2, 0.9]]),
+                torch.tensor([[False, False, False, True]]),
+                global_iterations=20,
+                tail_forced_mask=torch.tensor(
+                    [[False, True, False, False]]
+                ),
+                tail_halt_fraction=0.89,
+            ),
+            attention_mask=torch.tensor([[True, True, True, True]]),
+            exact_rows=torch.tensor([True]),
+            rows_with_targets=torch.tensor([True]),
+        )
+
+        summary = accumulator.summary(evaluation_task_cross_entropy=0.5)
+        assert summary is not None
+        caps = summary["cap_hits"]
+        self.assertEqual(caps["token_forced_cap_rate"], 0.25)
+        self.assertEqual(caps["token_tail_forced_rate"], 0.25)
+        self.assertEqual(caps["example_tail_forced_rate"], 1.0)
+        self.assertEqual(caps["batch_tail_forced_rate"], 1.0)
+        self.assertEqual(summary["tail_halt_fraction"], 0.89)
+        self.assertAlmostEqual(
+            summary["remainders"]["mean_tail_forced"], 0.4
+        )
+        second_iteration = summary["iteration_end_percentages"][1]
+        self.assertEqual(second_iteration["naturally_halted_at_percentage"], 25.0)
+        self.assertEqual(second_iteration["tail_forced_at_percentage"], 25.0)
+        self.assertEqual(second_iteration["cap_forced_at_percentage"], 0.0)
 
     def test_summarizes_two_batches_and_excludes_padding(self) -> None:
         accumulator = ActDiagnosticsAccumulator()

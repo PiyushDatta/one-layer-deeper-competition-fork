@@ -17,10 +17,16 @@ PONDER_WEIGHT = 0.005
 USE_ACT = True
 FIXED_LOOPS = 16
 ACT_MAX_LOOPS = 16
+ACT_TAIL_HALT_FRACTION = None
 DBUG = False
+
 if DBUG:
     print(
-        f"Constants\n D_MODEL: {D_MODEL}, NUM_HEADS: {NUM_HEADS}, PONDER_WEIGHT: {PONDER_WEIGHT}, USE_ACT: {USE_ACT}, FIXED_LOOPS: {FIXED_LOOPS}, ACT_MAX_LOOPS: {ACT_MAX_LOOPS}, DBUG: {DBUG}"
+        "Constants\n"
+        f" D_MODEL: {D_MODEL}, NUM_HEADS: {NUM_HEADS}, "
+        f"PONDER_WEIGHT: {PONDER_WEIGHT}, USE_ACT: {USE_ACT}, "
+        f"FIXED_LOOPS: {FIXED_LOOPS}, ACT_MAX_LOOPS: {ACT_MAX_LOOPS}, "
+        f"ACT_TAIL_HALT_FRACTION: {ACT_TAIL_HALT_FRACTION}, DBUG: {DBUG}"
     )
 
 
@@ -92,12 +98,15 @@ class UniversalProcessor(nn.Module):
         max_loops: int,
         halting_unit: nn.Linear | None = None,
         halting_prob_threshold: float = 0.01,
+        tail_halt_fraction: float | None = None,
     ) -> None:
         super().__init__()
         if max_loops < 1:
             raise ValueError("max_loops must be positive")
         if use_act and halting_unit is None:
             raise ValueError("ACT requires a halting unit")
+        if tail_halt_fraction is not None and not 0.0 < tail_halt_fraction <= 1.0:
+            raise ValueError("tail_halt_fraction must be in (0, 1]")
 
         self.block = block
         self.time_embedding = time_embedding
@@ -105,6 +114,7 @@ class UniversalProcessor(nn.Module):
         self.max_loops = max_loops
         self.halting_unit = halting_unit
         self.halting_prob_threshold = halting_prob_threshold
+        self.tail_halt_fraction = tail_halt_fraction
 
     def forward(
         self,
@@ -136,8 +146,10 @@ class UniversalProcessor(nn.Module):
         update_counts = torch.zeros_like(curr_halt_prob)
         remainders = torch.zeros_like(curr_halt_prob)
         cap_forced_mask = None
+        tail_forced_mask = None
         if DBUG and collect_act_diagnostics:
             cap_forced_mask = torch.zeros_like(curr_halt_prob, dtype=torch.bool)
+            tail_forced_mask = torch.zeros_like(curr_halt_prob, dtype=torch.bool)
         weighted_output = torch.zeros_like(x)
         threshold = 1.0 - self.halting_prob_threshold
         if attention_mask is None:
@@ -155,17 +167,24 @@ class UniversalProcessor(nn.Module):
                 raise RuntimeError("ACT processor has no halting unit")
             halting_logit = self.halting_unit(x)
             h = torch.sigmoid(halting_logit)
+            naturally_halted = was_running & (curr_halt_prob + h >= threshold)
+            tail_forced = torch.zeros_like(was_running)
+            if self.tail_halt_fraction is not None and step < self.max_loops - 1:
+                halted_after_natural = valid_tokens & (~was_running | naturally_halted)
+                halted_counts = halted_after_natural.sum(dim=1, keepdim=True)
+                valid_counts = valid_tokens.sum(dim=1, keepdim=True)
+                tail_cutoff_reached = halted_counts >= (
+                    self.tail_halt_fraction * valid_counts
+                )
+                tail_forced = was_running & ~naturally_halted & tail_cutoff_reached
+                if DBUG and tail_forced_mask is not None:
+                    tail_forced_mask = tail_forced_mask | tail_forced
             if step == self.max_loops - 1:
                 if DBUG and cap_forced_mask is not None:
-                    naturally_halted = was_running & (
-                        curr_halt_prob + h >= threshold
-                    )
                     cap_forced_mask = was_running & ~naturally_halted
                 newly_halted = was_running
             else:
-                newly_halted = was_running & (
-                    curr_halt_prob + h >= threshold
-                )
+                newly_halted = naturally_halted | tail_forced
             still_running = was_running & ~newly_halted
             update_counts = update_counts + was_running.to(dtype=x.dtype)
             remainder = 1.0 - curr_halt_prob
@@ -188,8 +207,10 @@ class UniversalProcessor(nn.Module):
                 "update_counts": update_counts.squeeze(-1).detach(),
                 "remainders": remainders.squeeze(-1).detach(),
                 "cap_forced_mask": cap_forced_mask.squeeze(-1).detach(),
+                "tail_forced_mask": tail_forced_mask.squeeze(-1).detach(),
                 "max_loops": self.max_loops,
                 "global_iterations": step + 1,
+                "tail_halt_fraction": self.tail_halt_fraction,
             }
         return weighted_output, ponder_cost, act_diagnostics
 
@@ -282,6 +303,7 @@ class Model(nn.Module):
             use_act=self.use_act,
             max_loops=self.max_loops,
             halting_unit=halting_unit,
+            tail_halt_fraction=(ACT_TAIL_HALT_FRACTION if self.use_act else None),
         )
 
     def forward(
@@ -292,9 +314,7 @@ class Model(nn.Module):
         positions = torch.arange(input_ids.shape[1], device=input_ids.device)
         x = self.token_embedding(input_ids)
         position_signal = self.position_embedding(positions)
-        collect_act_diagnostics = (
-            self.collect_act_diagnostics if DBUG else False
-        )
+        collect_act_diagnostics = self.collect_act_diagnostics if DBUG else False
         x, ponder_cost, act_diagnostics = self.processor(
             x,
             position_signal,

@@ -199,12 +199,23 @@ def _format_act_diagnostics(result: dict) -> str | None:
             forced_remainder_text = (
                 "N/A" if forced_remainder is None else f"{forced_remainder:.3f}"
             )
+            tail_remainder = remainders["mean_tail_forced"]
+            tail_remainder_text = (
+                "N/A" if tail_remainder is None else f"{tail_remainder:.3f}"
+            )
+            tail_halt_fraction = diagnostics["tail_halt_fraction"]
+            tail_cutoff_text = (
+                "off"
+                if tail_halt_fraction is None
+                else f"{100.0 * tail_halt_fraction:.2f}%"
+            )
             lines.append(
                 f"ACT_SUMMARY | seed={seed} split={split} | "
                 f"eval_task_CE="
                 f"{diagnostics['evaluation_task_cross_entropy']:.6f} | "
                 f"ponder={diagnostics['raw_mean_ponder_time']:.3f} | "
                 f"weighted_ponder={diagnostics['weighted_ponder_contribution']:.6f} | "
+                f"tail_cutoff={tail_cutoff_text} | "
                 f"updates mean/median/p90/p95/p99/max="
                 f"{updates['mean']:.3f}/{updates['median']:.3f}/"
                 f"{updates['p90']:.0f}/{updates['p95']:.0f}/"
@@ -217,8 +228,13 @@ def _format_act_diagnostics(result: dict) -> str | None:
                 f"cap_forced token/batch="
                 f"{100.0 * caps['token_forced_cap_rate']:.2f}%/"
                 f"{100.0 * caps['batch_forced_cap_rate']:.2f}% | "
-                f"remainder mean/forced="
-                f"{remainders['mean']:.3f}/{forced_remainder_text}"
+                f"tail_forced token/example/batch="
+                f"{100.0 * caps['token_tail_forced_rate']:.2f}%/"
+                f"{100.0 * caps['example_tail_forced_rate']:.2f}%/"
+                f"{100.0 * caps['batch_tail_forced_rate']:.2f}% | "
+                f"remainder mean/cap/tail="
+                f"{remainders['mean']:.3f}/{forced_remainder_text}/"
+                f"{tail_remainder_text}"
             )
             endings = " ".join(
                 f"{item['iteration']}:"

@@ -67,17 +67,21 @@ class ActDiagnosticsAccumulator:
         self._update_counts: list[torch.Tensor] = []
         self._remainders: list[torch.Tensor] = []
         self._cap_forced: list[torch.Tensor] = []
+        self._tail_forced: list[torch.Tensor] = []
         self._per_example_updates: list[torch.Tensor] = []
         self._per_example_ponder: list[torch.Tensor] = []
         self._per_example_reached_cap: list[torch.Tensor] = []
         self._per_example_forced_cap: list[torch.Tensor] = []
+        self._per_example_tail_forced: list[torch.Tensor] = []
         self._lengths: list[torch.Tensor] = []
         self._correct: list[torch.Tensor] = []
         self._global_iterations: list[int] = []
         self._batch_reached_cap: list[bool] = []
         self._batch_forced_cap: list[bool] = []
+        self._batch_tail_forced: list[bool] = []
         self._max_loops: int | None = None
         self._ponder_weight: float | None = None
+        self._tail_halt_fraction: float | None = None
 
     @property
     def has_data(self) -> bool:
@@ -107,6 +111,7 @@ class ActDiagnosticsAccumulator:
         max_loops = act["max_loops"]
         global_iterations = act["global_iterations"]
         ponder_weight = act["ponder_weight"]
+        tail_halt_fraction = act.get("tail_halt_fraction")
         if type(max_loops) is not int or max_loops < 1:
             raise ValueError("ACT max_loops must be one positive integer")
         if (
@@ -120,6 +125,12 @@ class ActDiagnosticsAccumulator:
             float(ponder_weight)
         ):
             raise ValueError("ACT ponder_weight must be finite")
+        if tail_halt_fraction is not None and (
+            not isinstance(tail_halt_fraction, (int, float))
+            or not math.isfinite(float(tail_halt_fraction))
+            or not 0.0 < float(tail_halt_fraction) <= 1.0
+        ):
+            raise ValueError("ACT tail_halt_fraction must be in (0, 1]")
         if self._max_loops is not None and max_loops != self._max_loops:
             raise ValueError("ACT max_loops changed within one evaluation split")
         if (
@@ -127,8 +138,17 @@ class ActDiagnosticsAccumulator:
             and float(ponder_weight) != self._ponder_weight
         ):
             raise ValueError("ACT ponder_weight changed within one evaluation split")
+        if self.has_data and tail_halt_fraction != self._tail_halt_fraction:
+            raise ValueError(
+                "ACT tail_halt_fraction changed within one evaluation split"
+            )
         self._max_loops = max_loops
         self._ponder_weight = float(ponder_weight)
+        self._tail_halt_fraction = (
+            None
+            if tail_halt_fraction is None
+            else float(tail_halt_fraction)
+        )
 
         expected_shape = attention_mask.shape
         tensors = {
@@ -145,6 +165,20 @@ class ActDiagnosticsAccumulator:
                 raise ValueError(f"ACT {name} must be detached")
         if tensors["cap_forced_mask"].dtype != torch.bool:
             raise TypeError("ACT cap_forced_mask must have boolean dtype")
+        tail_forced = act.get("tail_forced_mask")
+        if tail_forced is None:
+            tail_forced = torch.zeros_like(tensors["cap_forced_mask"])
+        elif (
+            not torch.is_tensor(tail_forced)
+            or tail_forced.shape != expected_shape
+        ):
+            raise ValueError(
+                f"ACT tail_forced_mask must have shape {tuple(expected_shape)}"
+            )
+        elif tail_forced.requires_grad:
+            raise ValueError("ACT tail_forced_mask must be detached")
+        if tail_forced.dtype != torch.bool:
+            raise TypeError("ACT tail_forced_mask must have boolean dtype")
         if exact_rows.shape != rows_with_targets.shape:
             raise ValueError("exact_rows and rows_with_targets must align by batch row")
 
@@ -152,11 +186,13 @@ class ActDiagnosticsAccumulator:
         updates = tensors["update_counts"].detach()
         remainders = tensors["remainders"].detach()
         cap_forced = tensors["cap_forced_mask"].detach()
+        tail_forced = tail_forced.detach()
         if not valid.any().item():
             return
         valid_updates = updates[valid].float()
         valid_remainders = remainders[valid].float()
         valid_cap_forced = cap_forced[valid].bool()
+        valid_tail_forced = tail_forced[valid].bool()
         if (
             not torch.isfinite(valid_updates).all().item()
             or not torch.isfinite(valid_remainders).all().item()
@@ -177,6 +213,10 @@ class ActDiagnosticsAccumulator:
             raise ValueError("ACT remainders must be between zero and one")
         if (valid_cap_forced & (valid_updates != max_loops)).any().item():
             raise ValueError("ACT cap-forced tokens must reach max_loops")
+        if (valid_cap_forced & valid_tail_forced).any().item():
+            raise ValueError(
+                "ACT cap-forced and tail-forced masks must not overlap"
+            )
         derived_global_iterations = int(valid_updates.max().item())
         if global_iterations != derived_global_iterations:
             raise ValueError(
@@ -189,6 +229,7 @@ class ActDiagnosticsAccumulator:
         selected_updates = updates[selected_rows]
         selected_remainders = remainders[selected_rows]
         selected_cap_forced = cap_forced[selected_rows]
+        selected_tail_forced = tail_forced[selected_rows]
         correct = exact_rows[selected_rows].detach()
         lengths = selected_valid.sum(dim=1)
         if (lengths == 0).any().item():
@@ -206,10 +247,12 @@ class ActDiagnosticsAccumulator:
             (selected_updates == max_loops) & selected_valid
         )
         selected_forced_cap = selected_cap_forced & selected_valid
+        selected_forced_tail = selected_tail_forced & selected_valid
 
         self._update_counts.append(valid_updates.cpu())
         self._remainders.append(valid_remainders.cpu())
         self._cap_forced.append(valid_cap_forced.cpu())
+        self._tail_forced.append(valid_tail_forced.cpu())
         self._per_example_updates.append(per_example_updates.float().cpu())
         self._per_example_ponder.append(per_example_ponder.float().cpu())
         self._per_example_reached_cap.append(
@@ -218,11 +261,17 @@ class ActDiagnosticsAccumulator:
         self._per_example_forced_cap.append(
             selected_forced_cap.sum(dim=1).cpu()
         )
+        self._per_example_tail_forced.append(
+            selected_forced_tail.sum(dim=1).cpu()
+        )
         self._lengths.append(lengths.cpu())
         self._correct.append(correct.bool().cpu())
         self._global_iterations.append(derived_global_iterations)
         self._batch_reached_cap.append(bool(reached_cap.any().item()))
         self._batch_forced_cap.append(bool(forced_cap.any().item()))
+        self._batch_tail_forced.append(
+            bool((tail_forced & valid).any().item())
+        )
 
     def summary(self, *, evaluation_task_cross_entropy: float) -> dict | None:
         if not self.has_data:
@@ -230,10 +279,12 @@ class ActDiagnosticsAccumulator:
         updates = torch.cat(self._update_counts)
         remainders = torch.cat(self._remainders)
         cap_forced = torch.cat(self._cap_forced)
+        tail_forced = torch.cat(self._tail_forced)
         example_updates = torch.cat(self._per_example_updates)
         example_ponder = torch.cat(self._per_example_ponder)
         example_reached = torch.cat(self._per_example_reached_cap)
         example_forced = torch.cat(self._per_example_forced_cap)
+        example_tail_forced = torch.cat(self._per_example_tail_forced)
         lengths = torch.cat(self._lengths)
         correct = torch.cat(self._correct)
         max_loops = self._max_loops
@@ -243,7 +294,7 @@ class ActDiagnosticsAccumulator:
 
         ponder_time = updates + remainders
         reached_cap = updates == max_loops
-        natural_halt = ~cap_forced
+        natural_halt = ~(cap_forced | tail_forced)
         token_count = updates.numel()
         observed_iterations = int(updates.max().item())
         reported_iterations = min(observed_iterations, MAX_ITERATION_DETAIL)
@@ -257,10 +308,18 @@ class ActDiagnosticsAccumulator:
             updates[natural_within_detail].long(),
             minlength=reported_iterations + 1,
         )[1 : reported_iterations + 1]
-        forced_histogram = histogram - natural_histogram
+        cap_forced_histogram = torch.bincount(
+            updates[cap_forced & within_detail].long(),
+            minlength=reported_iterations + 1,
+        )[1 : reported_iterations + 1]
+        tail_forced_histogram = torch.bincount(
+            updates[tail_forced & within_detail].long(),
+            minlength=reported_iterations + 1,
+        )[1 : reported_iterations + 1]
         cumulative = histogram.cumsum(dim=0)
         natural_cumulative = natural_histogram.cumsum(dim=0)
-        forced_cumulative = forced_histogram.cumsum(dim=0)
+        cap_forced_cumulative = cap_forced_histogram.cumsum(dim=0)
+        tail_forced_cumulative = tail_forced_histogram.cumsum(dim=0)
         endings = [
             {
                 "iteration": iteration,
@@ -277,10 +336,24 @@ class ActDiagnosticsAccumulator:
                     100.0 * int(natural_cumulative[iteration - 1]) / token_count
                 ),
                 "cap_forced_at_percentage": (
-                    100.0 * int(forced_histogram[iteration - 1]) / token_count
+                    100.0
+                    * int(cap_forced_histogram[iteration - 1])
+                    / token_count
                 ),
                 "cap_forced_by_percentage": (
-                    100.0 * int(forced_cumulative[iteration - 1]) / token_count
+                    100.0
+                    * int(cap_forced_cumulative[iteration - 1])
+                    / token_count
+                ),
+                "tail_forced_at_percentage": (
+                    100.0
+                    * int(tail_forced_histogram[iteration - 1])
+                    / token_count
+                ),
+                "tail_forced_by_percentage": (
+                    100.0
+                    * int(tail_forced_cumulative[iteration - 1])
+                    / token_count
                 ),
             }
             for iteration in range(1, reported_iterations + 1)
@@ -323,6 +396,9 @@ class ActDiagnosticsAccumulator:
                 "token_forced_cap_rate": (
                     int(example_forced[mask].sum().item()) / total_tokens
                 ),
+                "token_tail_forced_rate": (
+                    int(example_tail_forced[mask].sum().item()) / total_tokens
+                ),
             }
 
         return {
@@ -331,6 +407,7 @@ class ActDiagnosticsAccumulator:
             ),
             "raw_mean_ponder_time": float(ponder_time.double().mean().item()),
             "ponder_weight": ponder_weight,
+            "tail_halt_fraction": self._tail_halt_fraction,
             "weighted_ponder_contribution": (
                 ponder_weight * float(ponder_time.double().mean().item())
             ),
@@ -347,11 +424,21 @@ class ActDiagnosticsAccumulator:
                 "batch_forced_cap_rate": (
                     sum(self._batch_forced_cap) / len(self._batch_forced_cap)
                 ),
+                "token_tail_forced_rate": float(
+                    tail_forced.float().mean().item()
+                ),
+                "example_tail_forced_rate": float(
+                    (example_tail_forced > 0).float().mean().item()
+                ),
+                "batch_tail_forced_rate": (
+                    sum(self._batch_tail_forced) / len(self._batch_tail_forced)
+                ),
             },
             "remainders": {
                 "mean": mean_or_none(remainders),
                 "mean_natural_halt": mean_or_none(remainders[natural_halt]),
                 "mean_cap_forced": mean_or_none(remainders[cap_forced]),
+                "mean_tail_forced": mean_or_none(remainders[tail_forced]),
             },
             "iteration_end_percentages": endings,
             "iteration_detail_truncated": (
