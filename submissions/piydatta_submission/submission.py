@@ -82,87 +82,62 @@ class Block(nn.Module):
         return x + self.down(F.gelu(self.up(self.mixer_norm(x))))
 
 
-class Model(nn.Module):
-
-    def __init__(self, spec: ModelSpec, use_act: bool = False) -> None:
+class UniversalProcessor(nn.Module):
+    def __init__(
+        self,
+        block: Block,
+        time_embedding: nn.Embedding,
+        *,
+        use_act: bool,
+        max_loops: int,
+        halting_unit: nn.Linear | None = None,
+        halting_prob_threshold: float = 0.01,
+    ) -> None:
         super().__init__()
-        self.config = Config(spec.vocab_size, spec.max_seq_len)
+        if max_loops < 1:
+            raise ValueError("max_loops must be positive")
+        if use_act and halting_unit is None:
+            raise ValueError("ACT requires a halting unit")
+
+        self.block = block
+        self.time_embedding = time_embedding
         self.use_act = use_act
-        self.max_loops = ACT_MAX_LOOPS if self.use_act else FIXED_LOOPS
-        self.halting_prob_threshold = 0.01
-        if DBUG:
-            self.collect_act_diagnostics = False
-
-        self.token_embedding = nn.Embedding(spec.vocab_size, D_MODEL)
-        self.position_embedding = nn.Embedding(spec.max_seq_len, D_MODEL)
-        self.block = Block()
-        self.final_norm = RMSNorm(D_MODEL)
-        self.head = nn.Linear(D_MODEL, spec.vocab_size, bias=False)
-        self.head.weight = self.token_embedding.weight
-
-        init_std = 0.02
-        nn.init.normal_(self.token_embedding.weight, std=init_std)
-        nn.init.normal_(self.position_embedding.weight, std=init_std)
-
-        self.time_embedding = nn.Embedding(self.max_loops, D_MODEL)
-        nn.init.normal_(self.time_embedding.weight, std=init_std)
-
-        if self.use_act:
-            self.halting_unit = nn.Linear(D_MODEL, 1)
+        self.max_loops = max_loops
+        self.halting_unit = halting_unit
+        self.halting_prob_threshold = halting_prob_threshold
 
     def forward(
         self,
-        input_ids: Tensor,
+        x: Tensor,
+        position_signal: Tensor,
         attention_mask: Tensor | None = None,
-    ) -> tuple[Tensor, object]:
-        """
-        for ACT:
-            determine which tokens were running
-            construct block input:
-                active tokens receive position/time signal
-                halted tokens preserve their state
-            calculate candidate states
-            accept candidates only for active tokens
-            calculate h
-            determine newly halted tokens
-            update counts and remainders
-            update weighted output
-        """
+        *,
+        collect_act_diagnostics: bool = False,
+    ) -> tuple[Tensor, Tensor, dict[str, object] | None]:
         if self.use_act:
-            return self.forward_act(input_ids, attention_mask)
-        return self.forward_fixed(input_ids, attention_mask)
+            return self.forward_act(
+                x,
+                position_signal,
+                attention_mask,
+                collect_act_diagnostics=collect_act_diagnostics,
+            )
+        return self.forward_fixed(x, position_signal, attention_mask)
 
     def forward_act(
         self,
-        input_ids: Tensor,
+        x: Tensor,
+        position_signal: Tensor,
         attention_mask: Tensor | None = None,
-    ) -> tuple[Tensor, object]:
-        """
-        for ACT:
-            determine which tokens were running
-            construct block input:
-                active tokens receive position/time signal
-                halted tokens preserve their state
-            calculate candidate states
-            accept candidates only for active tokens
-            calculate h
-            determine newly halted tokens
-            update counts and remainders
-            update weighted output
-        """
-        positions = torch.arange(input_ids.shape[1], device=input_ids.device)
-        x = self.token_embedding(input_ids)
-        pos_signal = self.position_embedding(positions)
+        *,
+        collect_act_diagnostics: bool = False,
+    ) -> tuple[Tensor, Tensor, dict[str, object] | None]:
         batch_size, seq_len, _ = x.shape
         curr_halt_prob = x.new_zeros(batch_size, seq_len, 1)
         update_counts = torch.zeros_like(curr_halt_prob)
         remainders = torch.zeros_like(curr_halt_prob)
-        if DBUG:
-            cap_forced_mask = None
-            if self.collect_act_diagnostics:
-                cap_forced_mask = torch.zeros_like(
-                    curr_halt_prob, dtype=torch.bool
-                )
+        cap_forced_mask = None
+        if DBUG and collect_act_diagnostics:
+            cap_forced_mask = torch.zeros_like(curr_halt_prob, dtype=torch.bool)
         weighted_output = torch.zeros_like(x)
         threshold = 1.0 - self.halting_prob_threshold
         if attention_mask is None:
@@ -172,10 +147,12 @@ class Model(nn.Module):
 
         for step in range(self.max_loops):
             was_running = valid_tokens & (curr_halt_prob < threshold)
-            step_signal = pos_signal + self.time_embedding.weight[step]
+            step_signal = position_signal + self.time_embedding.weight[step]
             block_input = torch.where(was_running, x + step_signal, x)
             candidate_x = self.block(block_input, attention_mask)
             x = torch.where(was_running, candidate_x, x)
+            if self.halting_unit is None:
+                raise RuntimeError("ACT processor has no halting unit")
             halting_logit = self.halting_unit(x)
             h = torch.sigmoid(halting_logit)
             if step == self.max_loops - 1:
@@ -205,47 +182,134 @@ class Model(nn.Module):
 
         ponder_time = update_counts + remainders
         ponder_cost = ponder_time[valid_tokens].mean()
-        logits = self.head(self.final_norm(weighted_output))
-        if not DBUG:
-            return logits, ponder_cost
-
         act_diagnostics = None
-        if cap_forced_mask is not None:
+        if DBUG and cap_forced_mask is not None:
             act_diagnostics = {
                 "update_counts": update_counts.squeeze(-1).detach(),
                 "remainders": remainders.squeeze(-1).detach(),
                 "cap_forced_mask": cap_forced_mask.squeeze(-1).detach(),
                 "max_loops": self.max_loops,
                 "global_iterations": step + 1,
-                "ponder_weight": PONDER_WEIGHT,
             }
-        auxiliary = {
-            "ponder_cost": ponder_cost,
-            "act": act_diagnostics,
-        }
-        return logits, auxiliary
+        return weighted_output, ponder_cost, act_diagnostics
 
     def forward_fixed(
+        self,
+        x: Tensor,
+        position_signal: Tensor,
+        attention_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, None]:
+        for step in range(self.max_loops):
+            x = x + position_signal + self.time_embedding.weight[step]
+            x = self.block(x, attention_mask)
+
+        return x, x.new_zeros(()), None
+
+
+# TODO(piydatta): Experiment with using this processor to turn stored gradients
+# from the previous training step into temporary fast-weight updates. It is
+# intentionally not instantiated or used by Model yet.
+class GradientUpdateNetwork(nn.Module):
+    def __init__(self, *, use_act: bool, max_loops: int) -> None:
+        super().__init__()
+        self.row_embedding = nn.Embedding(D_MODEL, D_MODEL)
+        block = Block()
+        time_embedding = nn.Embedding(max_loops, D_MODEL)
+        halting_unit = nn.Linear(D_MODEL, 1) if use_act else None
+        self.processor = UniversalProcessor(
+            block,
+            time_embedding,
+            use_act=use_act,
+            max_loops=max_loops,
+            halting_unit=halting_unit,
+        )
+        self.final_norm = RMSNorm(D_MODEL)
+
+        init_std = 0.02
+        nn.init.normal_(self.row_embedding.weight, std=init_std)
+        nn.init.normal_(time_embedding.weight, std=init_std)
+
+    def forward(self, gradient_tokens: Tensor) -> tuple[Tensor, Tensor]:
+        added_batch_dimension = gradient_tokens.ndim == 2
+        if added_batch_dimension:
+            gradient_tokens = gradient_tokens.unsqueeze(0)
+        if gradient_tokens.ndim != 3 or gradient_tokens.shape[-1] != D_MODEL:
+            raise ValueError(
+                "gradient tokens must have shape (rows, D_MODEL) or "
+                "(batch, rows, D_MODEL)"
+            )
+
+        row_count = gradient_tokens.shape[-2]
+        if row_count > self.row_embedding.num_embeddings:
+            raise ValueError("gradient token count exceeds row embedding size")
+        row_positions = torch.arange(row_count, device=gradient_tokens.device)
+        row_signal = self.row_embedding(row_positions)
+        x, ponder_cost, _ = self.processor(gradient_tokens, row_signal)
+        x = self.final_norm(x)
+        if added_batch_dimension:
+            x = x.squeeze(0)
+        return x, ponder_cost
+
+
+class Model(nn.Module):
+
+    def __init__(self, spec: ModelSpec, use_act: bool = False) -> None:
+        super().__init__()
+        self.config = Config(spec.vocab_size, spec.max_seq_len)
+        self.use_act = use_act
+        self.max_loops = ACT_MAX_LOOPS if self.use_act else FIXED_LOOPS
+        if DBUG:
+            self.collect_act_diagnostics = False
+
+        self.token_embedding = nn.Embedding(spec.vocab_size, D_MODEL)
+        self.position_embedding = nn.Embedding(spec.max_seq_len, D_MODEL)
+        block = Block()
+        self.final_norm = RMSNorm(D_MODEL)
+        self.head = nn.Linear(D_MODEL, spec.vocab_size, bias=False)
+        self.head.weight = self.token_embedding.weight
+
+        init_std = 0.02
+        nn.init.normal_(self.token_embedding.weight, std=init_std)
+        nn.init.normal_(self.position_embedding.weight, std=init_std)
+
+        time_embedding = nn.Embedding(self.max_loops, D_MODEL)
+        nn.init.normal_(time_embedding.weight, std=init_std)
+
+        halting_unit = nn.Linear(D_MODEL, 1) if self.use_act else None
+        self.processor = UniversalProcessor(
+            block,
+            time_embedding,
+            use_act=self.use_act,
+            max_loops=self.max_loops,
+            halting_unit=halting_unit,
+        )
+
+    def forward(
         self,
         input_ids: Tensor,
         attention_mask: Tensor | None = None,
     ) -> tuple[Tensor, object]:
         positions = torch.arange(input_ids.shape[1], device=input_ids.device)
         x = self.token_embedding(input_ids)
-        pos_signal = self.position_embedding(positions)
-
-        for step in range(self.max_loops):
-            x = x + pos_signal + self.time_embedding.weight[step]
-            x = self.block(x, attention_mask)
-
-        ponder_cost = x.new_zeros(())
+        position_signal = self.position_embedding(positions)
+        collect_act_diagnostics = (
+            self.collect_act_diagnostics if DBUG else False
+        )
+        x, ponder_cost, act_diagnostics = self.processor(
+            x,
+            position_signal,
+            attention_mask,
+            collect_act_diagnostics=collect_act_diagnostics,
+        )
         logits = self.head(self.final_norm(x))
         if not DBUG:
             return logits, ponder_cost
 
+        if act_diagnostics is not None:
+            act_diagnostics["ponder_weight"] = PONDER_WEIGHT
         auxiliary = {
             "ponder_cost": ponder_cost,
-            "act": None,
+            "act": act_diagnostics,
         }
         return logits, auxiliary
 
