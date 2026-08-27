@@ -68,6 +68,166 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
         )
         self.assertFalse(diagnostics["update_counts"].requires_grad)
 
+    def test_synchronized_processor_keeps_prompt_memory_immutable(self) -> None:
+        width = self.namespace["D_MODEL"]
+        processor_class = self.namespace["SynchronizedProcessor"]
+        prompt_len = 2
+
+        class RecordingBlock(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.prompt_inputs = []
+                self.masks = []
+
+            def forward(self, x, attention_mask):
+                self.prompt_inputs.append(
+                    x[:, :prompt_len].detach().clone()
+                )
+                self.masks.append(attention_mask.detach().clone())
+                candidate = x.clone()
+                candidate[:, :prompt_len] = (
+                    candidate[:, :prompt_len] + 100.0
+                )
+                candidate[:, prompt_len:] = (
+                    candidate[:, prompt_len:] + 1.0
+                )
+                return candidate
+
+        block = RecordingBlock()
+        processor = processor_class(block, num_loops=2)
+        prompt_memory = torch.randn(1, prompt_len, width)
+        work_state = torch.zeros(1, prompt_len + 1, width)
+        attention_mask = torch.tensor([[True, False]])
+
+        result = processor(prompt_memory, work_state, attention_mask)
+
+        self.assertEqual(len(block.prompt_inputs), 2)
+        torch.testing.assert_close(block.prompt_inputs[0], prompt_memory)
+        torch.testing.assert_close(block.prompt_inputs[1], prompt_memory)
+        torch.testing.assert_close(result, torch.full_like(result, 2.0))
+        expected_joint_mask = torch.tensor(
+            [[True, False, True, True, False]]
+        )
+        torch.testing.assert_close(block.masks[0], expected_joint_mask)
+        torch.testing.assert_close(block.masks[1], expected_joint_mask)
+
+    def test_synchronized_processor_preserves_prompt_gradient_path(self) -> None:
+        width = self.namespace["D_MODEL"]
+        processor = self.namespace["SynchronizedProcessor"](
+            self.namespace["Block"](),
+            num_loops=1,
+        )
+        prompt_memory = torch.randn(1, 3, width, requires_grad=True)
+        work_state = torch.randn(1, 4, width, requires_grad=True)
+
+        result = processor(
+            prompt_memory,
+            work_state,
+            torch.ones(1, 3, dtype=torch.bool),
+        )
+        result.square().mean().backward()
+
+        self.assertGreater(prompt_memory.grad.abs().sum().item(), 0.0)
+        self.assertGreater(work_state.grad.abs().sum().item(), 0.0)
+
+    def test_default_model_uses_two_synchronized_loops(self) -> None:
+        self.namespace["DBUG"] = False
+        model = self.model_class(self.spec)
+
+        self.assertFalse(model.use_act)
+        self.assertEqual(model.max_loops, 2)
+        self.assertIsInstance(
+            model.processor,
+            self.namespace["SynchronizedProcessor"],
+        )
+        logits, auxiliary = model(self.input_ids, self.attention_mask)
+        self.assertEqual(logits.shape, (1, 4, 17))
+        self.assertEqual(auxiliary.item(), 0.0)
+
+    def test_workspace_starts_from_aligned_prompt_representation(self) -> None:
+        self.namespace["DBUG"] = False
+        model = self.model_class(self.spec)
+
+        class RecordingProcessor(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.prompt_memory = None
+                self.work_state = None
+
+            def forward(self, prompt_memory, work_state, attention_mask):
+                self.prompt_memory = prompt_memory.detach().clone()
+                self.work_state = work_state.detach().clone()
+                return work_state
+
+        processor = RecordingProcessor()
+        model.processor = processor
+        model(self.input_ids, self.attention_mask)
+
+        positions = torch.arange(self.input_ids.shape[1])
+        expected_prompt = (
+            model.token_embedding(self.input_ids)
+            + model.position_embedding(positions)
+        )
+        expected_workspace = (
+            expected_prompt + model.workspace_token.view(1, 1, -1)
+        )
+        expected_control = model.control_token.view(1, 1, -1).expand(
+            self.input_ids.shape[0], -1, -1
+        )
+
+        torch.testing.assert_close(processor.prompt_memory, expected_prompt)
+        torch.testing.assert_close(
+            processor.work_state[:, :1],
+            expected_control,
+        )
+        torch.testing.assert_close(
+            processor.work_state[:, 1:],
+            expected_workspace,
+        )
+
+    def test_synchronized_model_ignores_padded_token_ids(self) -> None:
+        self.namespace["DBUG"] = False
+        model = self.model_class(self.spec)
+        model.eval()
+        changed_padding = self.input_ids.clone()
+        changed_padding[0, -1] = 16
+
+        original_logits, _ = model(self.input_ids, self.attention_mask)
+        changed_logits, _ = model(changed_padding, self.attention_mask)
+
+        torch.testing.assert_close(
+            original_logits[:, :-1],
+            changed_logits[:, :-1],
+        )
+
+    def test_synchronized_debug_loss_reaches_all_state_components(self) -> None:
+        self.namespace["DBUG"] = True
+        model = self.model_class(self.spec)
+        logits, auxiliary = model(self.input_ids, self.attention_mask)
+
+        self.assertIsInstance(auxiliary, dict)
+        self.assertIsNone(auxiliary["act"])
+        self.assertEqual(auxiliary["ponder_cost"].item(), 0.0)
+        valid_logits = logits[self.attention_mask]
+        labels = torch.tensor([1, 2, 3])
+        loss = self.namespace["training_loss"](
+            valid_logits,
+            labels,
+            auxiliary,
+        )
+        loss.backward()
+
+        self.assertGreater(model.control_token.grad.abs().sum().item(), 0.0)
+        self.assertGreater(model.workspace_token.grad.abs().sum().item(), 0.0)
+        self.assertGreater(
+            model.token_embedding.weight.grad.abs().sum().item(),
+            0.0,
+        )
+        self.assertGreater(
+            model.processor.block.qkv.weight.grad.abs().sum().item(),
+            0.0,
+        )
+
     def test_tail_cutoff_is_counted_per_example(self) -> None:
         self.namespace["DBUG"] = True
         width = self.namespace["D_MODEL"]

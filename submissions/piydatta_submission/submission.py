@@ -14,8 +14,8 @@ from torch import nn, Tensor
 D_MODEL = 128
 NUM_HEADS = 4
 PONDER_WEIGHT = 0.005
-USE_ACT = True
-FIXED_LOOPS = 16
+USE_ACT = False
+FIXED_LOOPS = 2
 ACT_MAX_LOOPS = 16
 ACT_TAIL_HALT_FRACTION = None
 DBUG = False
@@ -86,6 +86,49 @@ class Block(nn.Module):
         x = x.transpose(1, 2).contiguous().view(batch, length, D_MODEL)
         x = residual + self.out(x)
         return x + self.down(F.gelu(self.up(self.mixer_norm(x))))
+
+
+class SynchronizedProcessor(nn.Module):
+    def __init__(self, block: Block, *, num_loops: int) -> None:
+        super().__init__()
+        if num_loops < 1:
+            raise ValueError("num_loops must be positive")
+        self.block = block
+        self.num_loops = num_loops
+
+    def forward(
+        self,
+        prompt_memory: Tensor,
+        work_state: Tensor,
+        attention_mask: Tensor | None = None,
+    ) -> Tensor:
+        batch_size, prompt_len, _ = prompt_memory.shape
+        if work_state.shape[:2] != (batch_size, prompt_len + 1):
+            raise ValueError(
+                "work_state must contain one control token followed by one "
+                "work token per prompt position"
+            )
+
+        joint_mask = None
+        if attention_mask is not None:
+            if attention_mask.shape != (batch_size, prompt_len):
+                raise ValueError("synchronized processor requires a padding mask")
+            prompt_mask = attention_mask.bool()
+            control_mask = torch.ones(
+                batch_size,
+                1,
+                dtype=torch.bool,
+                device=prompt_memory.device,
+            )
+            work_mask = torch.cat((control_mask, prompt_mask), dim=1)
+            joint_mask = torch.cat((prompt_mask, work_mask), dim=1)
+
+        for _ in range(self.num_loops):
+            joint_state = torch.cat((prompt_memory, work_state), dim=1)
+            candidate_state = self.block(joint_state, joint_mask)
+            work_state = candidate_state[:, prompt_len:]
+
+        return work_state
 
 
 class UniversalProcessor(nn.Module):
@@ -293,18 +336,26 @@ class Model(nn.Module):
         nn.init.normal_(self.token_embedding.weight, std=init_std)
         nn.init.normal_(self.position_embedding.weight, std=init_std)
 
-        time_embedding = nn.Embedding(self.max_loops, D_MODEL)
-        nn.init.normal_(time_embedding.weight, std=init_std)
-
-        halting_unit = nn.Linear(D_MODEL, 1) if self.use_act else None
-        self.processor = UniversalProcessor(
-            block,
-            time_embedding,
-            use_act=self.use_act,
-            max_loops=self.max_loops,
-            halting_unit=halting_unit,
-            tail_halt_fraction=(ACT_TAIL_HALT_FRACTION if self.use_act else None),
-        )
+        if self.use_act:
+            time_embedding = nn.Embedding(self.max_loops, D_MODEL)
+            nn.init.normal_(time_embedding.weight, std=init_std)
+            self.processor = UniversalProcessor(
+                block,
+                time_embedding,
+                use_act=True,
+                max_loops=self.max_loops,
+                halting_unit=nn.Linear(D_MODEL, 1),
+                tail_halt_fraction=ACT_TAIL_HALT_FRACTION,
+            )
+        else:
+            self.control_token = nn.Parameter(torch.empty(D_MODEL))
+            self.workspace_token = nn.Parameter(torch.empty(D_MODEL))
+            nn.init.normal_(self.control_token, std=init_std)
+            nn.init.normal_(self.workspace_token, std=init_std)
+            self.processor = SynchronizedProcessor(
+                block,
+                num_loops=self.max_loops,
+            )
 
     def forward(
         self,
@@ -312,15 +363,34 @@ class Model(nn.Module):
         attention_mask: Tensor | None = None,
     ) -> tuple[Tensor, object]:
         positions = torch.arange(input_ids.shape[1], device=input_ids.device)
-        x = self.token_embedding(input_ids)
         position_signal = self.position_embedding(positions)
-        collect_act_diagnostics = self.collect_act_diagnostics if DBUG else False
-        x, ponder_cost, act_diagnostics = self.processor(
-            x,
-            position_signal,
-            attention_mask,
-            collect_act_diagnostics=collect_act_diagnostics,
-        )
+        token_state = self.token_embedding(input_ids)
+        if self.use_act:
+            collect_act_diagnostics = (
+                self.collect_act_diagnostics if DBUG else False
+            )
+            x, ponder_cost, act_diagnostics = self.processor(
+                token_state,
+                position_signal,
+                attention_mask,
+                collect_act_diagnostics=collect_act_diagnostics,
+            )
+        else:
+            batch_size = input_ids.shape[0]
+            prompt_memory = token_state + position_signal
+            control_state = self.control_token.view(1, 1, -1).expand(
+                batch_size, -1, -1
+            )
+            workspace_state = prompt_memory + self.workspace_token.view(1, 1, -1)
+            work_state = torch.cat((control_state, workspace_state), dim=1)
+            work_state = self.processor(
+                prompt_memory,
+                work_state,
+                attention_mask,
+            )
+            x = work_state[:, 1:]
+            ponder_cost = x.new_zeros(())
+            act_diagnostics = None
         logits = self.head(self.final_norm(x))
         if not DBUG:
             return logits, ponder_cost
