@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
 from dataclasses import replace
+import io
+import json
 import subprocess
 import sys
 import tempfile
@@ -14,18 +17,22 @@ import torch
 from benchmark import ModelSpec, OptimizerBundle, Submission
 from benchmark.manifest import load_manifest
 from benchmark.metrics import MetricRecorder
+from benchmark.model_diagnostics import TrainingModelDiagnosticsTrajectory
 from data.squaring_mod import generate_squaring_mod_smoke_dataset
 
 from benchmark.runner import (
     _evaluate,
     _depth_split_names,
+    _emit_final_metrics,
     _format_competition_progress,
+    _read_experiment_number,
     _resolve_batch_sizes,
     _run_seed,
     _scoring_split_names,
     _submission_requests_act_diagnostics,
     _train,
     _with_batch_size,
+    _write_debug_metrics_report,
     cli,
 )
 
@@ -51,6 +58,218 @@ class RunnerBudgetTests(unittest.TestCase):
             _submission_requests_act_diagnostics(
                 submission_without_debug_constant
             )
+        )
+
+    def test_reads_explicit_experiment_number_without_scanning_config_ids(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "EXPERIMENTS.md"
+            path.write_text(
+                "# Experiments\r\n"
+                "  Next experiment number: 13  \r\n"
+                "| C-A32-100 | not an ordinal |\r\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(_read_experiment_number(path), 13)
+
+            path.write_text("# No counter\n", encoding="utf-8")
+            self.assertIsNone(_read_experiment_number(path))
+            self.assertIsNone(
+                _read_experiment_number(Path(directory) / "missing.md")
+            )
+
+    def test_rejects_duplicate_or_invalid_experiment_number_markers(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "EXPERIMENTS.md"
+            path.write_text(
+                "Next experiment number: 13\n"
+                "Next experiment number: 14\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "more than one"):
+                _read_experiment_number(path)
+
+            path.write_text(
+                "Next experiment number: thirteen\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "invalid"):
+                _read_experiment_number(path)
+
+    def test_debug_metrics_report_uses_temp_directory_and_keeps_full_result(
+        self,
+    ) -> None:
+        result = {
+            "manifest": "debug-run",
+            "score": {"mean_exact_accuracy": 0.25},
+            "seeds": [
+                {
+                    "seed": 74,
+                    "act_diagnostics": {"large": "act"},
+                    "model_diagnostics": {"large": "model"},
+                    "training_model_diagnostics": {"large": "training"},
+                }
+            ],
+        }
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch(
+                "benchmark.runner._format_training_model_diagnostics",
+                return_value="TRAINING_SENTINEL",
+            ),
+            patch(
+                "benchmark.runner._format_act_diagnostics",
+                return_value="ACT_SENTINEL",
+            ),
+            patch(
+                "benchmark.runner._format_model_diagnostics",
+                return_value="MODEL_SENTINEL",
+            ),
+            patch(
+                "benchmark.runner._format_competition_progress",
+                return_value="COMPETITION_SENTINEL",
+            ),
+        ):
+            submission_path = Path(directory) / "submission.py"
+            experiments_path = Path(directory) / "EXPERIMENTS.md"
+            submission_source = "DBUG = True\n# exact source sentinel"
+            path = _write_debug_metrics_report(
+                result,
+                experiment_number=13,
+                experiments_path=experiments_path,
+                submission_path=submission_path,
+                submission_source=submission_source,
+                directory=directory,
+            )
+            report = path.read_text(encoding="utf-8")
+
+        self.assertEqual(path.parent, Path(directory).resolve())
+        self.assertEqual(report.splitlines()[0], "EXPERIMENT_NUMBER=13")
+        self.assertIn(f"EXPERIMENTS_FILE={experiments_path.resolve()}", report)
+        self.assertIn(f"SUBMISSION_FILE={submission_path.resolve()}", report)
+        self.assertIn("[TRAINING_DIAGNOSTICS]\nTRAINING_SENTINEL", report)
+        self.assertIn("[ACT_DIAGNOSTICS]\nACT_SENTINEL", report)
+        self.assertIn("[MODEL_DIAGNOSTICS]\nMODEL_SENTINEL", report)
+        self.assertIn(
+            "[COMPETITION_PROGRESS]\nCOMPETITION_SENTINEL",
+            report,
+        )
+        full_result_json = report.split("[RESULT_JSON]\n", 1)[1].split(
+            "\n\n[SUBMISSION_SOURCE]",
+            1,
+        )[0]
+        full_result = json.loads(full_result_json)
+        self.assertIn("act_diagnostics", full_result["seeds"][0])
+        self.assertIn("model_diagnostics", full_result["seeds"][0])
+        self.assertIn(
+            "training_model_diagnostics",
+            full_result["seeds"][0],
+        )
+        self.assertTrue(
+            report.endswith("[SUBMISSION_SOURCE]\n" + submission_source + "\n")
+        )
+
+    def test_debug_console_is_compact_and_ends_with_metrics_path(self) -> None:
+        result = {
+            "manifest": "debug-run",
+            "score": {"mean_exact_accuracy": 0.25},
+            "seeds": [
+                {
+                    "seed": 74,
+                    "evaluation": {"test": {"exact_accuracy": 0.25}},
+                    "act_diagnostics": {"large": "act"},
+                    "model_diagnostics": {"large": "model"},
+                    "training_model_diagnostics": {"large": "training"},
+                }
+            ],
+        }
+        expected_path = Path(tempfile.gettempdir()).resolve() / "metrics.txt"
+        output = io.StringIO()
+        with (
+            patch(
+                "benchmark.runner._write_debug_metrics_report",
+                return_value=expected_path,
+            ),
+            patch(
+                "benchmark.runner._format_competition_progress",
+                return_value="COMPETITION_SENTINEL",
+            ),
+            redirect_stdout(output),
+        ):
+            returned_path = _emit_final_metrics(
+                result,
+                debug_metrics_to_file=True,
+                experiment_number=13,
+                experiments_path="EXPERIMENTS.md",
+                submission_path="submission.py",
+                submission_source="DBUG = True\n",
+            )
+
+        lines = [line for line in output.getvalue().splitlines() if line]
+        self.assertEqual(returned_path, expected_path)
+        self.assertEqual(
+            lines[-1],
+            f"DEBUG_METRICS_FILE | path={expected_path}",
+        )
+        self.assertEqual(lines.count("COMPETITION_SENTINEL"), 1)
+        result_line = next(
+            line for line in lines if line.startswith("RESULT_JSON=")
+        )
+        compact_result = json.loads(result_line.removeprefix("RESULT_JSON="))
+        compact_seed = compact_result["seeds"][0]
+        self.assertIn("evaluation", compact_seed)
+        self.assertNotIn("act_diagnostics", compact_seed)
+        self.assertNotIn("model_diagnostics", compact_seed)
+        self.assertNotIn("training_model_diagnostics", compact_seed)
+        self.assertEqual(
+            sum(line.startswith("DEBUG_METRICS_FILE |") for line in lines),
+            1,
+        )
+
+    def test_non_debug_console_preserves_full_result_and_creates_no_file(
+        self,
+    ) -> None:
+        result = {
+            "manifest": "normal-run",
+            "score": {"mean_exact_accuracy": 0.25},
+            "seeds": [{"seed": 74, "model_diagnostics": {"marker": 1}}],
+        }
+        output = io.StringIO()
+        with (
+            patch("benchmark.runner._write_debug_metrics_report") as writer,
+            patch(
+                "benchmark.runner._format_act_diagnostics",
+                return_value=None,
+            ),
+            patch(
+                "benchmark.runner._format_model_diagnostics",
+                return_value=None,
+            ),
+            patch(
+                "benchmark.runner._format_competition_progress",
+                return_value=None,
+            ),
+            redirect_stdout(output),
+        ):
+            returned_path = _emit_final_metrics(
+                result,
+                debug_metrics_to_file=False,
+            )
+
+        writer.assert_not_called()
+        self.assertIsNone(returned_path)
+        result_line = next(
+            line
+            for line in output.getvalue().splitlines()
+            if line.startswith("RESULT_JSON=")
+        )
+        emitted_result = json.loads(result_line.removeprefix("RESULT_JSON="))
+        self.assertEqual(
+            emitted_result["seeds"][0]["model_diagnostics"],
+            {"marker": 1},
         )
 
     def test_formats_competition_progress_from_worst_seed(self) -> None:
@@ -356,6 +575,94 @@ class RunnerBudgetTests(unittest.TestCase):
             [1, 37],
         )
 
+    def test_training_model_diagnostics_capture_log_and_terminal_steps(self) -> None:
+        model = torch.nn.Linear(1, 1, bias=False)
+        model.collect_model_diagnostics = False
+        model.collect_training_diagnostics = False
+        credit_flags = []
+
+        def consume_credit():
+            return {
+                "segment_token_counts": torch.tensor([0, 1, 1, 1, 0]),
+                "segment_signal_grad_rms": torch.tensor(0.2),
+                "segment_signal_grad_rms_by_segment": torch.tensor(
+                    [0.0, 0.1, 0.2, 0.3, 0.0]
+                ),
+                "stages": [
+                    {
+                        "step": 0,
+                        "state_grad_rms": torch.tensor(0.4),
+                        "relative_to_final": torch.tensor(1.0),
+                        "state_grad_rms_by_segment": torch.tensor(
+                            [0.0, 0.1, 0.2, 0.3, 0.0]
+                        ),
+                        "control_grad_rms": None,
+                    }
+                ],
+            }
+
+        model.consume_training_grad_diagnostics = consume_credit
+        bundle = OptimizerBundle(torch.optim.SGD(model.parameters(), lr=0.1))
+        manifest = SimpleNamespace(
+            runtime=SimpleNamespace(grad_clip=0.25, log_every=3),
+            model_state=object(),
+        )
+        trajectory = TrainingModelDiagnosticsTrajectory()
+
+        def loss_and_accuracy(*args, **kwargs):
+            credit_flags.append(model.collect_training_diagnostics)
+            return model.weight.sum(), 0.5, 1, 1
+
+        with (
+            patch("benchmark.runner._loss_and_accuracy", side_effect=loss_and_accuracy),
+            patch(
+                "benchmark.runner._collect_training_model_checkpoint",
+                return_value=({"marker": "model"}, 0.75, 0.25),
+            ),
+            patch(
+                "benchmark.runner._format_training_model_diagnostic",
+                return_value="MODEL_TRAIN_TEST",
+            ) as format_diagnostic,
+            patch("benchmark.runner.validate_model_state"),
+            patch("benchmark.runner.validate_optimizer", return_value=0),
+            patch("benchmark.runner.time.monotonic", return_value=1.0),
+        ):
+            _train(
+                raw_model=model,
+                train_model=model,
+                training_loss=None,
+                bundle=bundle,
+                dataloader=[object()],
+                manifest=manifest,
+                device=torch.device("cpu"),
+                started_at=0.0,
+                deadline=2.0,
+                budget_seconds=2.0,
+                max_steps=4,
+                seed=74,
+                model_diagnostics_trajectory=trajectory,
+            )
+
+        format_diagnostic.assert_not_called()
+        summary = trajectory.summary()
+        assert summary is not None
+        self.assertEqual(
+            [record["step"] for record in summary["records"]],
+            [1, 3, 4],
+        )
+        self.assertEqual(credit_flags, [True, True, True, True])
+        terminal = summary["records"][-1]
+        self.assertEqual(terminal["training_credit"]["segment_token_counts"], [0, 1, 1, 1, 0])
+        gradients = terminal["optimization"]
+        self.assertGreater(
+            gradients["gradient_before_clipping"]["gradient_norm"],
+            gradients["gradient_after_clipping"]["gradient_norm"],
+        )
+        self.assertGreater(
+            gradients["optimizer_update"]["update_norm"],
+            0.0,
+        )
+
     def test_seed_receives_half_its_training_allowance_for_evaluation(self) -> None:
         manifest = load_manifest(ROOT / "benchmark" / "manifests" / "smoke_cpu.json")
         model_spec = ModelSpec(1, 1, 2)
@@ -514,6 +821,7 @@ class RunnerBudgetTests(unittest.TestCase):
                 max_seq_len=spec.max_seq_len,
             )
             model.collect_act_diagnostics = False
+            model.collect_model_diagnostics = False
             return model
 
         submission = Submission(
@@ -551,9 +859,18 @@ class RunnerBudgetTests(unittest.TestCase):
             }
 
         diagnostics = [
-            {"act_diagnostics": {"marker": "test"}},
-            {"act_diagnostics": {"marker": "seen_n/T=1"}},
-            {"act_diagnostics": {"marker": "ood_n/T=1"}},
+            {
+                "act_diagnostics": {"marker": "test"},
+                "model_diagnostics": {"marker": "model/test"},
+            },
+            {
+                "act_diagnostics": {"marker": "seen_n/T=1"},
+                "model_diagnostics": {"marker": "model/seen_n/T=1"},
+            },
+            {
+                "act_diagnostics": {"marker": "ood_n/T=1"},
+                "model_diagnostics": {"marker": "model/ood_n/T=1"},
+            },
         ]
         with (
             patch("benchmark.runner._train", return_value=(0.0, 1, 1.0, 0)),
@@ -586,6 +903,7 @@ class RunnerBudgetTests(unittest.TestCase):
         )
         for call in evaluate.call_args_list[1:]:
             self.assertTrue(call.kwargs["include_act_diagnostics"])
+            self.assertTrue(call.kwargs["include_model_diagnostics"])
             self.assertEqual(call.kwargs["deadline"], float("inf"))
         self.assertEqual(
             result["act_diagnostics"]["scoring_splits"]["test"]["marker"],
@@ -603,7 +921,19 @@ class RunnerBudgetTests(unittest.TestCase):
             ]["diagnostics"]["marker"],
             "ood_n/T=1",
         )
-        self.assertIn("act_diagnostics_seconds", result)
+        self.assertIn("debug_diagnostics_seconds", result)
+        self.assertNotIn("act_diagnostics_seconds", result)
+        self.assertEqual(
+            result["model_diagnostics"]["scoring_splits"]["test"]["marker"],
+            "model/test",
+        )
+        self.assertEqual(
+            result["model_diagnostics"]["first_uncertified_depth_rungs"][
+                "seen_n"
+            ]["diagnostics"]["marker"],
+            "model/seen_n/T=1",
+        )
+        self.assertNotIn("model_diagnostics_seconds", result)
 
     def test_multi_pass_updates_and_bounded_batch_reuse(self) -> None:
         class CountingSGD(torch.optim.SGD):

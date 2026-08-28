@@ -1,6 +1,7 @@
 # Universal Transformer and ACT experiment log
 
-Last updated: 2026-08-25
+Last updated: 2026-08-27
+Next experiment number: 13
 
 This file records the `piydatta_submission` experiments discussed during development so results remain available outside the chat history.
 
@@ -248,7 +249,7 @@ python -m benchmark.runner --manifest benchmark/manifests/h100_easy_e1.json --su
 - update counts for correct versus incorrect examples;
 - update counts by sequence length and test/OOD split.
 
-Diagnostics run in a second, non-scoring pass after the normal result and depth profile are fixed. Their time is reported separately as `act_diagnostics_seconds` and must not be compared with the ordinary `evaluation_seconds` field.
+Diagnostics run in a second, non-scoring pass after the normal result and depth profile are fixed. Their shared ACT/model time is reported as `debug_diagnostics_seconds` and must not be compared with the ordinary `evaluation_seconds` field. When `DBUG=True`, the runner holds the full training, ACT, model, and JSON telemetry in memory, flushes one report to an operating-system temporary file after the run, and prints its absolute path as the final output line. The report starts with the `Next experiment number` declared near the top of this file and ends with the exact stable `submission.py` source captured around import.
 
 Wall-clock time is controlled by the slowest active token in a dense-attention batch, so global iterations per batch are more informative than mean token updates alone.
 

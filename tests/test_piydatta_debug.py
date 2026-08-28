@@ -32,6 +32,9 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
         self.namespace["DBUG"] = False
         model = self.model_class(self.spec, use_act=True)
         self.assertFalse(hasattr(model, "collect_act_diagnostics"))
+        self.assertFalse(hasattr(model, "collect_model_diagnostics"))
+        self.assertFalse(hasattr(model, "collect_training_diagnostics"))
+        self.assertFalse(hasattr(model, "_debug_initial_parameter_buffers"))
 
         logits, auxiliary = model(self.input_ids, self.attention_mask)
 
@@ -44,6 +47,8 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
             self.input_ids, self.attention_mask
         )
         self.assertFalse(hasattr(fixed_model, "collect_act_diagnostics"))
+        self.assertFalse(hasattr(fixed_model, "collect_model_diagnostics"))
+        self.assertFalse(hasattr(fixed_model, "collect_training_diagnostics"))
         self.assertTrue(torch.is_tensor(fixed_auxiliary))
         self.assertEqual(fixed_auxiliary.ndim, 0)
 
@@ -67,6 +72,156 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
             self.attention_mask.shape,
         )
         self.assertFalse(diagnostics["update_counts"].requires_grad)
+
+    def test_debug_model_diagnostics_are_complete_and_noninvasive(self) -> None:
+        self.namespace["DBUG"] = True
+        model = self.model_class(self.spec, use_act=False)
+        model.eval()
+
+        baseline_logits, baseline_auxiliary = model(
+            self.input_ids,
+            self.attention_mask,
+        )
+        self.assertIsNone(baseline_auxiliary["model_diagnostics"])
+
+        model.collect_model_diagnostics = True
+        diagnostic_logits, auxiliary = model(
+            self.input_ids,
+            self.attention_mask,
+        )
+        torch.testing.assert_close(diagnostic_logits, baseline_logits)
+
+        diagnostics = auxiliary["model_diagnostics"]
+        self.assertIsInstance(diagnostics, dict)
+        self.assertEqual(
+            diagnostics["segment_token_counts"].shape,
+            (self.namespace["NUM_SEGMENTS"],),
+        )
+        self.assertEqual(len(diagnostics["layers"]), model.max_loops)
+        self.assertEqual(len(diagnostics["stage_logits"]), model.max_loops + 1)
+        self.assertEqual(
+            set(diagnostics["segment_counterfactual_logits"]),
+            {"zero", "permuted", "zero_nx", "zero_t", "swap_n_x"},
+        )
+        for counterfactual_logits in diagnostics[
+            "segment_counterfactual_logits"
+        ].values():
+            self.assertEqual(counterfactual_logits.shape, diagnostic_logits.shape)
+            self.assertFalse(counterfactual_logits.requires_grad)
+        for layer in diagnostics["layers"]:
+            self.assertEqual(
+                layer["attention_mass_by_segment"].shape,
+                (
+                    self.namespace["NUM_SEGMENTS"],
+                    self.namespace["NUM_SEGMENTS"],
+                ),
+            )
+            self.assertEqual(
+                layer["attention_mass_by_stream"].shape,
+                (self.namespace["NUM_SEGMENTS"], 3),
+            )
+            self.assertFalse(layer["input_rms"].requires_grad)
+            self.assertTrue(
+                torch.isfinite(layer["attention_mass_by_segment"]).all()
+            )
+
+        segment_stats = diagnostics["segment_embedding"]
+        self.assertTrue(torch.equal(segment_stats["delta_norms"], torch.zeros(5)))
+        persistent_state = model.state_dict()
+        self.assertFalse(
+            any(name.startswith("_debug_initial_parameter_") for name in persistent_state)
+        )
+
+    def test_act_model_diagnostic_stages_end_at_weighted_output(self) -> None:
+        self.namespace["DBUG"] = True
+        model = self.model_class(self.spec, use_act=True)
+        model.eval()
+        model.collect_act_diagnostics = True
+        model.collect_model_diagnostics = True
+
+        logits, auxiliary = model(self.input_ids, self.attention_mask)
+
+        model_diagnostics = auxiliary["model_diagnostics"]
+        self.assertIsNotNone(auxiliary["act"])
+        torch.testing.assert_close(
+            model_diagnostics["stage_logits"][-1]["logits"],
+            logits,
+        )
+        for layer in model_diagnostics["layers"]:
+            populated = layer["segment_query_counts"] > 0
+            stream_mass = layer["attention_mass_by_stream"]
+            torch.testing.assert_close(
+                stream_mass[populated, 2],
+                torch.ones_like(stream_mass[populated, 2]),
+            )
+
+    def test_model_diagnostics_do_not_change_training_gradients(self) -> None:
+        self.namespace["DBUG"] = True
+        model = self.model_class(self.spec, use_act=False)
+        model.eval()
+
+        baseline_logits, _ = model(self.input_ids, self.attention_mask)
+        baseline_logits[self.attention_mask].square().mean().backward()
+        baseline_gradient = model.processor.block.qkv.weight.grad.detach().clone()
+
+        model.zero_grad(set_to_none=True)
+        model.collect_model_diagnostics = True
+        diagnostic_logits, _ = model(self.input_ids, self.attention_mask)
+        diagnostic_logits[self.attention_mask].square().mean().backward()
+
+        torch.testing.assert_close(
+            model.processor.block.qkv.weight.grad,
+            baseline_gradient,
+        )
+
+    def test_sampled_training_diagnostics_trace_gradient_credit(self) -> None:
+        self.namespace["DBUG"] = True
+        model = self.model_class(self.spec, use_act=False)
+        model.train()
+        model.collect_training_diagnostics = True
+
+        logits, _ = model(self.input_ids, self.attention_mask)
+        logits[self.attention_mask].square().mean().backward()
+        diagnostics = model.consume_training_grad_diagnostics()
+
+        self.assertEqual(len(diagnostics["stages"]), model.max_loops + 1)
+        self.assertEqual(
+            diagnostics["segment_signal_grad_rms_by_segment"].shape,
+            (self.namespace["NUM_SEGMENTS"],),
+        )
+        self.assertEqual(
+            diagnostics["segment_token_counts"].sum().item(),
+            self.attention_mask.sum().item(),
+        )
+        for stage in diagnostics["stages"]:
+            self.assertTrue(torch.isfinite(stage["state_grad_rms"]))
+            self.assertTrue(torch.isfinite(stage["relative_to_final"]))
+            self.assertIsNotNone(stage["control_grad_rms"])
+        self.assertAlmostEqual(
+            diagnostics["stages"][-1]["relative_to_final"].item(),
+            1.0,
+        )
+        with self.assertRaisesRegex(RuntimeError, "no sampled training"):
+            model.consume_training_grad_diagnostics()
+
+    def test_act_training_diagnostics_trace_executed_stages(self) -> None:
+        self.namespace["DBUG"] = True
+        model = self.model_class(self.spec, use_act=True)
+        model.train()
+        model.collect_act_diagnostics = True
+        model.collect_training_diagnostics = True
+
+        logits, auxiliary = model(self.input_ids, self.attention_mask)
+        logits[self.attention_mask].square().mean().backward()
+        diagnostics = model.consume_training_grad_diagnostics()
+
+        self.assertEqual(
+            len(diagnostics["stages"]),
+            auxiliary["act"]["global_iterations"] + 1,
+        )
+        self.assertTrue(
+            all(stage["control_grad_rms"] is None for stage in diagnostics["stages"])
+        )
 
     def test_synchronized_processor_keeps_prompt_memory_immutable(self) -> None:
         width = self.namespace["D_MODEL"]
@@ -144,6 +299,36 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
         self.assertEqual(logits.shape, (1, 4, 17))
         self.assertEqual(auxiliary.item(), 0.0)
 
+    def test_act_and_fixed_modes_share_common_initialization(self) -> None:
+        self.namespace["DBUG"] = False
+        torch.manual_seed(1234)
+        fixed_model = self.model_class(self.spec, use_act=False)
+        torch.manual_seed(1234)
+        act_model = self.model_class(self.spec, use_act=True)
+
+        torch.testing.assert_close(
+            fixed_model.token_embedding.weight,
+            act_model.token_embedding.weight,
+        )
+        torch.testing.assert_close(
+            fixed_model.position_embedding.weight,
+            act_model.position_embedding.weight,
+        )
+        torch.testing.assert_close(
+            fixed_model.segment_embedding.weight,
+            act_model.segment_embedding.weight,
+        )
+        torch.testing.assert_close(
+            fixed_model.final_norm.weight,
+            act_model.final_norm.weight,
+        )
+        for fixed_parameter, act_parameter in zip(
+            fixed_model.processor.block.parameters(),
+            act_model.processor.block.parameters(),
+            strict=True,
+        ):
+            torch.testing.assert_close(fixed_parameter, act_parameter)
+
     def test_workspace_starts_from_aligned_prompt_representation(self) -> None:
         self.namespace["DBUG"] = False
         model = self.model_class(self.spec)
@@ -164,9 +349,11 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
         model(self.input_ids, self.attention_mask)
 
         positions = torch.arange(self.input_ids.shape[1])
+        segment_ids = torch.tensor([[0, 1, 2, 0]])
         expected_prompt = (
             model.token_embedding(self.input_ids)
             + model.position_embedding(positions)
+            + model.segment_embedding(segment_ids)
         )
         expected_workspace = (
             expected_prompt + model.workspace_token.view(1, 1, -1)
@@ -184,6 +371,42 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
             processor.work_state[:, 1:],
             expected_workspace,
         )
+
+    def test_segment_embeddings_follow_prompt_fields(self) -> None:
+        self.namespace["DBUG"] = False
+        spec = ModelSpec(17, 11, 1_000_000)
+        model = self.model_class(spec)
+        captured_segment_ids = []
+
+        def capture_segment_ids(module, inputs):
+            del module
+            captured_segment_ids.append(inputs[0].detach().clone())
+
+        handle = model.segment_embedding.register_forward_pre_hook(
+            capture_segment_ids
+        )
+        try:
+            prompt_only = torch.tensor(
+                [[2, 10, 9, 10, 3, 9, 7, 4, 8, 0, 0]]
+            )
+            prompt_mask = prompt_only.ne(0)
+            model(prompt_only, prompt_mask)
+            torch.testing.assert_close(
+                captured_segment_ids[-1],
+                torch.tensor([[1, 1, 1, 1, 2, 2, 2, 3, 3, 0, 0]]),
+            )
+
+            causal_style = torch.tensor(
+                [[1, 2, 10, 3, 9, 4, 8, 5, 14, 6, 0]]
+            )
+            causal_mask = causal_style.ne(0)
+            model(causal_style, causal_mask)
+            torch.testing.assert_close(
+                captured_segment_ids[-1],
+                torch.tensor([[0, 1, 1, 2, 2, 3, 3, 4, 4, 4, 0]]),
+            )
+        finally:
+            handle.remove()
 
     def test_synchronized_model_ignores_padded_token_ids(self) -> None:
         self.namespace["DBUG"] = False
@@ -221,6 +444,10 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
         self.assertGreater(model.workspace_token.grad.abs().sum().item(), 0.0)
         self.assertGreater(
             model.token_embedding.weight.grad.abs().sum().item(),
+            0.0,
+        )
+        self.assertGreater(
+            model.segment_embedding.weight.grad.abs().sum().item(),
             0.0,
         )
         self.assertGreater(

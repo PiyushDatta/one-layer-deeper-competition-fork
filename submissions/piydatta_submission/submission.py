@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 from benchmark import (
@@ -11,24 +13,27 @@ from benchmark import (
 )
 from torch import nn, Tensor
 
-D_MODEL = 128
-NUM_HEADS = 4
+D_MODEL = 288
+NUM_HEADS = 9
+D_FF = 4 * D_MODEL
 PONDER_WEIGHT = 0.005
 USE_ACT = False
 FIXED_LOOPS = 2
 ACT_MAX_LOOPS = 16
 ACT_TAIL_HALT_FRACTION = None
+USE_MUON = True
+MUON_LR = 1e-3
+MUON_MOMENTUM = 0.95
+MUON_WEIGHT_DECAY = 0.1
+MUON_ADJUST_LR_FN = "match_rms_adamw"
 DBUG = False
 
-if DBUG:
-    print(
-        "Constants\n"
-        f" D_MODEL: {D_MODEL}, NUM_HEADS: {NUM_HEADS}, "
-        f"PONDER_WEIGHT: {PONDER_WEIGHT}, USE_ACT: {USE_ACT}, "
-        f"FIXED_LOOPS: {FIXED_LOOPS}, ACT_MAX_LOOPS: {ACT_MAX_LOOPS}, "
-        f"ACT_TAIL_HALT_FRACTION: {ACT_TAIL_HALT_FRACTION}, DBUG: {DBUG}"
-    )
-
+PAD_TOKEN_ID = 0
+N_TOKEN_ID = 2
+X_TOKEN_ID = 3
+T_TOKEN_ID = 4
+ANS_TOKEN_ID = 5
+NUM_SEGMENTS = 5
 
 def training_loss(
     logits: Tensor,
@@ -62,10 +67,20 @@ class Block(nn.Module):
         self.qkv = nn.Linear(D_MODEL, 3 * D_MODEL)
         self.out = nn.Linear(D_MODEL, D_MODEL)
         self.mixer_norm = RMSNorm(D_MODEL)
-        self.up = nn.Linear(D_MODEL, 4 * D_MODEL)
-        self.down = nn.Linear(4 * D_MODEL, D_MODEL)
+        self.up = nn.Linear(D_MODEL, D_FF)
+        self.down = nn.Linear(D_FF, D_MODEL)
 
-    def forward(self, x: Tensor, attention_mask: Tensor | None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        attention_mask: Tensor | None,
+        *,
+        layer_diagnostics: list[dict[str, object]] | None = None,
+        segment_ids: Tensor | None = None,
+        query_mask: Tensor | None = None,
+        key_mask: Tensor | None = None,
+        key_stream_ids: Tensor | None = None,
+    ) -> Tensor:
         residual = x
         x = self.attention_norm(x)
         batch, length, _ = x.shape
@@ -84,8 +99,243 @@ class Block(nn.Module):
             mask = mask.to(device=x.device, dtype=torch.bool)
         x = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         x = x.transpose(1, 2).contiguous().view(batch, length, D_MODEL)
-        x = residual + self.out(x)
-        return x + self.down(F.gelu(self.up(self.mixer_norm(x))))
+        attention_update = self.out(x)
+        post_attention = residual + attention_update
+        mlp_update = self.down(
+            F.gelu(self.up(self.mixer_norm(post_attention)))
+        )
+        output = post_attention + mlp_update
+
+        if DBUG and layer_diagnostics is not None:
+            self._append_diagnostics(
+                layer_diagnostics,
+                input_state=residual,
+                attention_update=attention_update,
+                post_attention=post_attention,
+                mlp_update=mlp_update,
+                output_state=output,
+                q=q,
+                k=k,
+                attention_mask=mask,
+                segment_ids=segment_ids,
+                query_mask=query_mask,
+                key_mask=key_mask,
+                key_stream_ids=key_stream_ids,
+            )
+        return output
+
+    @staticmethod
+    def _masked_mean(values: Tensor, mask: Tensor) -> Tensor:
+        mask_float = mask.to(dtype=values.dtype)
+        return (values * mask_float).sum() / mask_float.sum().clamp_min(1.0)
+
+    @classmethod
+    def _masked_rms(cls, values: Tensor, mask: Tensor) -> Tensor:
+        token_mean_square = values.float().square().mean(dim=-1)
+        return cls._masked_mean(token_mean_square, mask).clamp_min(0.0).sqrt()
+
+    @classmethod
+    def _rms_by_segment(
+        cls,
+        values: Tensor,
+        segment_ids: Tensor,
+        mask: Tensor,
+    ) -> Tensor:
+        return torch.stack(
+            [
+                cls._masked_rms(
+                    values,
+                    mask & segment_ids.eq(segment),
+                )
+                for segment in range(NUM_SEGMENTS)
+            ]
+        )
+
+    @classmethod
+    def _append_diagnostics(
+        cls,
+        diagnostics: list[dict[str, object]],
+        *,
+        input_state: Tensor,
+        attention_update: Tensor,
+        post_attention: Tensor,
+        mlp_update: Tensor,
+        output_state: Tensor,
+        q: Tensor,
+        k: Tensor,
+        attention_mask: Tensor | None,
+        segment_ids: Tensor | None,
+        query_mask: Tensor | None,
+        key_mask: Tensor | None,
+        key_stream_ids: Tensor | None,
+    ) -> None:
+        batch_size, sequence_length, _ = input_state.shape
+        device = input_state.device
+        if segment_ids is None:
+            segment_ids = torch.zeros(
+                batch_size,
+                sequence_length,
+                dtype=torch.long,
+                device=device,
+            )
+        if segment_ids.shape != (batch_size, sequence_length):
+            raise ValueError("diagnostic segment_ids must match the block sequence")
+        if query_mask is None:
+            query_mask = torch.ones(
+                batch_size,
+                sequence_length,
+                dtype=torch.bool,
+                device=device,
+            )
+        else:
+            query_mask = query_mask.bool()
+        if key_mask is None:
+            key_mask = torch.ones_like(query_mask)
+        else:
+            key_mask = key_mask.bool()
+        if query_mask.shape != (batch_size, sequence_length):
+            raise ValueError("diagnostic query_mask must match the block sequence")
+        if key_mask.shape != (batch_size, sequence_length):
+            raise ValueError("diagnostic key_mask must match the block sequence")
+        if key_stream_ids is None:
+            key_stream_ids = torch.full(
+                (batch_size, sequence_length),
+                2,
+                dtype=torch.long,
+                device=device,
+            )
+        if key_stream_ids.shape != (batch_size, sequence_length):
+            raise ValueError(
+                "diagnostic key_stream_ids must match the block sequence"
+            )
+
+        input_value = input_state.detach().float()
+        attention_value = attention_update.detach().float()
+        post_attention_value = post_attention.detach().float()
+        mlp_value = mlp_update.detach().float()
+        output_value = output_state.detach().float()
+        segment_ids = segment_ids.detach()
+        query_mask = query_mask.detach()
+        key_mask = key_mask.detach()
+        key_stream_ids = key_stream_ids.detach()
+
+        input_rms = cls._masked_rms(input_value, query_mask)
+        attention_rms = cls._masked_rms(attention_value, query_mask)
+        post_attention_rms = cls._masked_rms(
+            post_attention_value,
+            query_mask,
+        )
+        mlp_rms = cls._masked_rms(mlp_value, query_mask)
+        output_rms = cls._masked_rms(output_value, query_mask)
+        input_output_cosines = F.cosine_similarity(
+            input_value,
+            output_value,
+            dim=-1,
+        )
+        input_output_cosine = cls._masked_mean(
+            input_output_cosines,
+            query_mask,
+        )
+
+        q_value = q.detach().float()
+        k_value = k.detach().float()
+        attention_scores = torch.matmul(
+            q_value,
+            k_value.transpose(-2, -1),
+        ) / math.sqrt(q_value.shape[-1])
+        if attention_mask is not None:
+            diagnostic_mask = attention_mask.detach().bool()
+            attention_scores = attention_scores.masked_fill(
+                ~diagnostic_mask,
+                torch.finfo(attention_scores.dtype).min,
+            )
+        else:
+            diagnostic_mask = None
+        attention_probabilities = attention_scores.softmax(dim=-1)
+        if diagnostic_mask is not None:
+            attention_probabilities = attention_probabilities.masked_fill(
+                ~diagnostic_mask,
+                0.0,
+            )
+        attention_probabilities = torch.nan_to_num(attention_probabilities)
+        entropy_per_head = -(
+            attention_probabilities
+            * attention_probabilities.clamp_min(1e-12).log()
+        ).sum(dim=-1)
+        attention_entropy = cls._masked_mean(
+            entropy_per_head.mean(dim=1),
+            query_mask,
+        )
+        effective_attended_tokens = cls._masked_mean(
+            entropy_per_head.exp().mean(dim=1),
+            query_mask,
+        )
+
+        mean_attention = attention_probabilities.mean(dim=1)
+        attention_mass_rows = []
+        attention_stream_rows = []
+        segment_query_counts = []
+        for query_segment in range(NUM_SEGMENTS):
+            selected_queries = query_mask & segment_ids.eq(query_segment)
+            query_count = selected_queries.sum()
+            segment_query_counts.append(query_count)
+            key_masses = []
+            for key_segment in range(NUM_SEGMENTS):
+                selected_keys = key_mask & segment_ids.eq(key_segment)
+                mass_per_query = (
+                    mean_attention
+                    * selected_keys[:, None, :].to(mean_attention.dtype)
+                ).sum(dim=-1)
+                key_masses.append(
+                    cls._masked_mean(mass_per_query, selected_queries)
+                )
+            attention_mass_rows.append(torch.stack(key_masses))
+            stream_masses = []
+            for key_stream in range(3):
+                selected_keys = key_mask & key_stream_ids.eq(key_stream)
+                mass_per_query = (
+                    mean_attention
+                    * selected_keys[:, None, :].to(mean_attention.dtype)
+                ).sum(dim=-1)
+                stream_masses.append(
+                    cls._masked_mean(mass_per_query, selected_queries)
+                )
+            attention_stream_rows.append(torch.stack(stream_masses))
+
+        state_change = output_value - input_value
+        diagnostics.append(
+            {
+                "step": len(diagnostics) + 1,
+                "valid_query_count": query_mask.sum().detach(),
+                "input_rms": input_rms.detach(),
+                "attention_update_rms": attention_rms.detach(),
+                "attention_update_ratio": (
+                    attention_rms / input_rms.clamp_min(1e-12)
+                ).detach(),
+                "mlp_update_rms": mlp_rms.detach(),
+                "mlp_update_ratio": (
+                    mlp_rms / post_attention_rms.clamp_min(1e-12)
+                ).detach(),
+                "output_rms": output_rms.detach(),
+                "input_output_cosine": input_output_cosine.detach(),
+                "attention_entropy": attention_entropy.detach(),
+                "effective_attended_tokens": effective_attended_tokens.detach(),
+                "segment_query_counts": torch.stack(
+                    segment_query_counts
+                ).detach(),
+                "attention_mass_by_segment": torch.stack(
+                    attention_mass_rows
+                ).detach(),
+                "attention_mass_by_stream": torch.stack(
+                    attention_stream_rows
+                ).detach(),
+                "state_change_rms_by_segment": cls._rms_by_segment(
+                    state_change,
+                    segment_ids,
+                    query_mask,
+                ).detach(),
+            }
+        )
 
 
 class SynchronizedProcessor(nn.Module):
@@ -101,6 +351,11 @@ class SynchronizedProcessor(nn.Module):
         prompt_memory: Tensor,
         work_state: Tensor,
         attention_mask: Tensor | None = None,
+        *,
+        segment_ids: Tensor | None = None,
+        layer_diagnostics: list[dict[str, object]] | None = None,
+        stage_states: list[Tensor] | None = None,
+        training_stage_states: list[Tensor] | None = None,
     ) -> Tensor:
         batch_size, prompt_len, _ = prompt_memory.shape
         if work_state.shape[:2] != (batch_size, prompt_len + 1):
@@ -109,24 +364,85 @@ class SynchronizedProcessor(nn.Module):
                 "work token per prompt position"
             )
 
+        prompt_mask = torch.ones(
+            batch_size,
+            prompt_len,
+            dtype=torch.bool,
+            device=prompt_memory.device,
+        )
         joint_mask = None
         if attention_mask is not None:
             if attention_mask.shape != (batch_size, prompt_len):
                 raise ValueError("synchronized processor requires a padding mask")
             prompt_mask = attention_mask.bool()
-            control_mask = torch.ones(
-                batch_size,
-                1,
-                dtype=torch.bool,
-                device=prompt_memory.device,
-            )
+        control_mask = torch.ones(
+            batch_size,
+            1,
+            dtype=torch.bool,
+            device=prompt_memory.device,
+        )
+        work_mask = torch.cat((control_mask, prompt_mask), dim=1)
+        if attention_mask is not None:
             work_mask = torch.cat((control_mask, prompt_mask), dim=1)
             joint_mask = torch.cat((prompt_mask, work_mask), dim=1)
 
+        joint_segment_ids = None
+        joint_stream_ids = None
+        if layer_diagnostics is not None:
+            if segment_ids is None or segment_ids.shape != (
+                batch_size,
+                prompt_len,
+            ):
+                raise ValueError(
+                    "segment_ids are required for synchronized diagnostics"
+                )
+            control_segments = torch.zeros(
+                batch_size,
+                1,
+                dtype=segment_ids.dtype,
+                device=segment_ids.device,
+            )
+            work_segments = torch.cat((control_segments, segment_ids), dim=1)
+            joint_segment_ids = torch.cat(
+                (segment_ids, work_segments),
+                dim=1,
+            )
+            prompt_streams = torch.zeros_like(segment_ids)
+            control_stream = torch.ones_like(control_segments)
+            work_streams = torch.full_like(segment_ids, 2)
+            joint_stream_ids = torch.cat(
+                (prompt_streams, control_stream, work_streams),
+                dim=1,
+            )
+        if stage_states is not None:
+            stage_states.append(work_state[:, 1:].detach())
+        if training_stage_states is not None:
+            work_state.retain_grad()
+            training_stage_states.append(work_state)
+
         for _ in range(self.num_loops):
             joint_state = torch.cat((prompt_memory, work_state), dim=1)
-            candidate_state = self.block(joint_state, joint_mask)
+            if layer_diagnostics is None:
+                candidate_state = self.block(joint_state, joint_mask)
+            else:
+                candidate_state = self.block(
+                    joint_state,
+                    joint_mask,
+                    layer_diagnostics=layer_diagnostics,
+                    segment_ids=joint_segment_ids,
+                    query_mask=torch.cat(
+                        (torch.zeros_like(prompt_mask), work_mask),
+                        dim=1,
+                    ),
+                    key_mask=torch.cat((prompt_mask, work_mask), dim=1),
+                    key_stream_ids=joint_stream_ids,
+                )
             work_state = candidate_state[:, prompt_len:]
+            if stage_states is not None:
+                stage_states.append(work_state[:, 1:].detach())
+            if training_stage_states is not None:
+                work_state.retain_grad()
+                training_stage_states.append(work_state)
 
         return work_state
 
@@ -166,6 +482,10 @@ class UniversalProcessor(nn.Module):
         attention_mask: Tensor | None = None,
         *,
         collect_act_diagnostics: bool = False,
+        segment_ids: Tensor | None = None,
+        layer_diagnostics: list[dict[str, object]] | None = None,
+        stage_states: list[Tensor] | None = None,
+        training_stage_states: list[Tensor] | None = None,
     ) -> tuple[Tensor, Tensor, dict[str, object] | None]:
         if self.use_act:
             return self.forward_act(
@@ -173,8 +493,20 @@ class UniversalProcessor(nn.Module):
                 position_signal,
                 attention_mask,
                 collect_act_diagnostics=collect_act_diagnostics,
+                segment_ids=segment_ids,
+                layer_diagnostics=layer_diagnostics,
+                stage_states=stage_states,
+                training_stage_states=training_stage_states,
             )
-        return self.forward_fixed(x, position_signal, attention_mask)
+        return self.forward_fixed(
+            x,
+            position_signal,
+            attention_mask,
+            segment_ids=segment_ids,
+            layer_diagnostics=layer_diagnostics,
+            stage_states=stage_states,
+            training_stage_states=training_stage_states,
+        )
 
     def forward_act(
         self,
@@ -183,6 +515,10 @@ class UniversalProcessor(nn.Module):
         attention_mask: Tensor | None = None,
         *,
         collect_act_diagnostics: bool = False,
+        segment_ids: Tensor | None = None,
+        layer_diagnostics: list[dict[str, object]] | None = None,
+        stage_states: list[Tensor] | None = None,
+        training_stage_states: list[Tensor] | None = None,
     ) -> tuple[Tensor, Tensor, dict[str, object] | None]:
         batch_size, seq_len, _ = x.shape
         curr_halt_prob = x.new_zeros(batch_size, seq_len, 1)
@@ -200,12 +536,36 @@ class UniversalProcessor(nn.Module):
         else:
             valid_tokens = attention_mask.unsqueeze(-1).bool()
 
+        if stage_states is not None:
+            stage_states.append(x.detach())
+        if training_stage_states is not None:
+            x.retain_grad()
+            training_stage_states.append(x)
         for step in range(self.max_loops):
             was_running = valid_tokens & (curr_halt_prob < threshold)
             step_signal = position_signal + self.time_embedding.weight[step]
             block_input = torch.where(was_running, x + step_signal, x)
-            candidate_x = self.block(block_input, attention_mask)
+            if layer_diagnostics is None:
+                candidate_x = self.block(block_input, attention_mask)
+            else:
+                candidate_x = self.block(
+                    block_input,
+                    attention_mask,
+                    layer_diagnostics=layer_diagnostics,
+                    segment_ids=segment_ids,
+                    query_mask=was_running.squeeze(-1),
+                    key_mask=valid_tokens.squeeze(-1),
+                    key_stream_ids=torch.full(
+                        x.shape[:2],
+                        2,
+                        dtype=torch.long,
+                        device=x.device,
+                    ),
+                )
             x = torch.where(was_running, candidate_x, x)
+            if training_stage_states is not None:
+                x.retain_grad()
+                training_stage_states.append(x)
             if self.halting_unit is None:
                 raise RuntimeError("ACT processor has no halting unit")
             halting_logit = self.halting_unit(x)
@@ -239,6 +599,11 @@ class UniversalProcessor(nn.Module):
             )
             curr_halt_prob = curr_halt_prob + update_prob
             weighted_output = weighted_output + update_prob * x
+            if stage_states is not None:
+                provisional_output = weighted_output + (
+                    1.0 - curr_halt_prob
+                ) * valid_tokens.to(dtype=x.dtype) * x
+                stage_states.append(provisional_output.detach())
             if not (valid_tokens & (curr_halt_prob < threshold)).any():
                 break
 
@@ -262,10 +627,55 @@ class UniversalProcessor(nn.Module):
         x: Tensor,
         position_signal: Tensor,
         attention_mask: Tensor | None = None,
+        *,
+        segment_ids: Tensor | None = None,
+        layer_diagnostics: list[dict[str, object]] | None = None,
+        stage_states: list[Tensor] | None = None,
+        training_stage_states: list[Tensor] | None = None,
     ) -> tuple[Tensor, Tensor, None]:
+        if attention_mask is None:
+            valid_tokens = torch.ones(
+                x.shape[:2],
+                dtype=torch.bool,
+                device=x.device,
+            )
+        elif attention_mask.shape == x.shape[:2]:
+            valid_tokens = attention_mask.bool()
+        else:
+            valid_tokens = torch.ones(
+                x.shape[:2],
+                dtype=torch.bool,
+                device=x.device,
+            )
+        if stage_states is not None:
+            stage_states.append(x.detach())
+        if training_stage_states is not None:
+            x.retain_grad()
+            training_stage_states.append(x)
         for step in range(self.max_loops):
             x = x + position_signal + self.time_embedding.weight[step]
-            x = self.block(x, attention_mask)
+            if layer_diagnostics is None:
+                x = self.block(x, attention_mask)
+            else:
+                x = self.block(
+                    x,
+                    attention_mask,
+                    layer_diagnostics=layer_diagnostics,
+                    segment_ids=segment_ids,
+                    query_mask=valid_tokens,
+                    key_mask=valid_tokens,
+                    key_stream_ids=torch.full(
+                        x.shape[:2],
+                        2,
+                        dtype=torch.long,
+                        device=x.device,
+                    ),
+                )
+            if stage_states is not None:
+                stage_states.append(x.detach())
+            if training_stage_states is not None:
+                x.retain_grad()
+                training_stage_states.append(x)
 
         return x, x.new_zeros(()), None
 
@@ -324,6 +734,9 @@ class Model(nn.Module):
         self.max_loops = ACT_MAX_LOOPS if self.use_act else FIXED_LOOPS
         if DBUG:
             self.collect_act_diagnostics = False
+            self.collect_model_diagnostics = False
+            self.collect_training_diagnostics = False
+            self._debug_training_context = None
 
         self.token_embedding = nn.Embedding(spec.vocab_size, D_MODEL)
         self.position_embedding = nn.Embedding(spec.max_seq_len, D_MODEL)
@@ -335,6 +748,17 @@ class Model(nn.Module):
         init_std = 0.02
         nn.init.normal_(self.token_embedding.weight, std=init_std)
         nn.init.normal_(self.position_embedding.weight, std=init_std)
+
+        # Keep every shared parameter ahead of the ACT/fixed branch so both
+        # modes receive identical shared initialization under the same seed.
+        self.segment_embedding = nn.Embedding(
+            NUM_SEGMENTS,
+            D_MODEL,
+            padding_idx=0,
+        )
+        nn.init.normal_(self.segment_embedding.weight, std=init_std)
+        with torch.no_grad():
+            self.segment_embedding.weight[0].zero_()
 
         if self.use_act:
             time_embedding = nn.Embedding(self.max_loops, D_MODEL)
@@ -357,6 +781,302 @@ class Model(nn.Module):
                 num_loops=self.max_loops,
             )
 
+        if DBUG:
+            self._debug_initial_parameter_buffers = {}
+            with torch.no_grad():
+                for index, (name, parameter) in enumerate(
+                    self.named_parameters()
+                ):
+                    buffer_name = f"_debug_initial_parameter_{index}"
+                    self.register_buffer(
+                        buffer_name,
+                        parameter.detach().clone(),
+                        persistent=False,
+                    )
+                    self._debug_initial_parameter_buffers[name] = buffer_name
+
+    def _run_processor(
+        self,
+        token_state: Tensor,
+        position_signal: Tensor,
+        attention_mask: Tensor | None,
+        *,
+        segment_ids: Tensor | None = None,
+        collect_act_diagnostics: bool = False,
+        layer_diagnostics: list[dict[str, object]] | None = None,
+        stage_states: list[Tensor] | None = None,
+        training_stage_states: list[Tensor] | None = None,
+    ) -> tuple[Tensor, Tensor, dict[str, object] | None]:
+        if self.use_act:
+            processor_kwargs = {
+                "collect_act_diagnostics": collect_act_diagnostics,
+            }
+            if (
+                layer_diagnostics is not None
+                or training_stage_states is not None
+            ):
+                processor_kwargs.update(
+                    {
+                        "segment_ids": segment_ids,
+                        "layer_diagnostics": layer_diagnostics,
+                        "stage_states": stage_states,
+                        "training_stage_states": training_stage_states,
+                    }
+                )
+            return self.processor(
+                token_state,
+                position_signal,
+                attention_mask,
+                **processor_kwargs,
+            )
+
+        batch_size = token_state.shape[0]
+        prompt_memory = token_state + position_signal
+        control_state = self.control_token.view(1, 1, -1).expand(
+            batch_size,
+            -1,
+            -1,
+        )
+        workspace_state = prompt_memory + self.workspace_token.view(1, 1, -1)
+        work_state = torch.cat((control_state, workspace_state), dim=1)
+        if layer_diagnostics is None and training_stage_states is None:
+            work_state = self.processor(
+                prompt_memory,
+                work_state,
+                attention_mask,
+            )
+        else:
+            work_state = self.processor(
+                prompt_memory,
+                work_state,
+                attention_mask,
+                segment_ids=segment_ids,
+                layer_diagnostics=layer_diagnostics,
+                stage_states=stage_states,
+                training_stage_states=training_stage_states,
+            )
+        x = work_state[:, 1:]
+        return x, x.new_zeros(()), None
+
+    @staticmethod
+    def _debug_segment_means(
+        values: Tensor,
+        segment_ids: Tensor,
+        valid_tokens: Tensor,
+    ) -> Tensor:
+        return torch.stack(
+            [
+                Block._masked_mean(
+                    values,
+                    valid_tokens & segment_ids.eq(segment),
+                )
+                for segment in range(NUM_SEGMENTS)
+            ]
+        )
+
+    def _debug_parameter_stats(self) -> dict[str, dict[str, Tensor]]:
+        stats = {}
+        for name, parameter in self.named_parameters():
+            buffer_name = self._debug_initial_parameter_buffers[name]
+            initial = getattr(self, buffer_name).detach().float()
+            current = parameter.detach().float()
+            initial_norm = initial.norm()
+            delta_norm = (current - initial).norm()
+            stats[name] = {
+                "norm": current.norm().detach(),
+                "delta_norm": delta_norm.detach(),
+                "relative_delta": (
+                    delta_norm / initial_norm.clamp_min(1e-12)
+                ).detach(),
+            }
+        return stats
+
+    def _debug_segment_embedding_stats(self) -> dict[str, Tensor]:
+        buffer_name = self._debug_initial_parameter_buffers[
+            "segment_embedding.weight"
+        ]
+        initial = getattr(self, buffer_name).detach().float()
+        current = self.segment_embedding.weight.detach().float()
+        initial_norms = initial.norm(dim=-1)
+        current_norms = current.norm(dim=-1)
+        delta_norms = (current - initial).norm(dim=-1)
+        cosine_denominator = current_norms * initial_norms
+        initial_cosines = torch.where(
+            cosine_denominator > 0,
+            (current * initial).sum(dim=-1)
+            / cosine_denominator.clamp_min(1e-12),
+            torch.zeros_like(cosine_denominator),
+        )
+        normalized = current / current_norms[:, None].clamp_min(1e-12)
+        cosine_matrix = normalized @ normalized.transpose(0, 1)
+        nonzero_rows = current_norms > 0
+        cosine_matrix = cosine_matrix * (
+            nonzero_rows[:, None] & nonzero_rows[None, :]
+        ).to(cosine_matrix.dtype)
+        return {
+            "norms": current_norms.detach(),
+            "delta_norms": delta_norms.detach(),
+            "relative_deltas": (
+                delta_norms / initial_norms.clamp_min(1e-12)
+            ).detach(),
+            "initial_cosines": initial_cosines.detach(),
+            "cosine_matrix": cosine_matrix.detach(),
+        }
+
+    def consume_training_grad_diagnostics(self) -> dict[str, object]:
+        if not DBUG or self._debug_training_context is None:
+            raise RuntimeError("no sampled training diagnostics are available")
+        context = self._debug_training_context
+        self._debug_training_context = None
+
+        segment_signal = context["segment_signal"]
+        segment_ids = context["segment_ids"]
+        valid_tokens = context["valid_tokens"]
+        training_stage_states = context["training_stage_states"]
+        synchronized = context["synchronized"]
+        if segment_signal.grad is None:
+            raise RuntimeError("segment signal did not receive a training gradient")
+
+        segment_gradient = segment_signal.grad.detach().float()
+        segment_counts = torch.stack(
+            [
+                (valid_tokens & segment_ids.eq(segment)).sum()
+                for segment in range(NUM_SEGMENTS)
+            ]
+        ).detach()
+        stages = []
+        for step, state in enumerate(training_stage_states):
+            if state.grad is None:
+                raise RuntimeError(
+                    f"recurrent training state at step {step} has no gradient"
+                )
+            state_gradient = state.grad.detach().float()
+            control_gradient_rms = None
+            if synchronized:
+                control_gradient_rms = (
+                    state_gradient[:, :1].square().mean().sqrt().detach()
+                )
+                state_gradient = state_gradient[:, 1:]
+            stages.append(
+                {
+                    "step": step,
+                    "state_grad_rms": Block._masked_rms(
+                        state_gradient,
+                        valid_tokens,
+                    ).detach(),
+                    "state_grad_rms_by_segment": Block._rms_by_segment(
+                        state_gradient,
+                        segment_ids,
+                        valid_tokens,
+                    ).detach(),
+                    "control_grad_rms": control_gradient_rms,
+                }
+            )
+        final_gradient_rms = stages[-1]["state_grad_rms"]
+        for stage in stages:
+            stage["relative_to_final"] = (
+                stage["state_grad_rms"]
+                / final_gradient_rms.clamp_min(1e-12)
+            ).detach()
+
+        return {
+            "segment_token_counts": segment_counts,
+            "segment_signal_grad_rms": Block._masked_rms(
+                segment_gradient,
+                valid_tokens,
+            ).detach(),
+            "segment_signal_grad_rms_by_segment": Block._rms_by_segment(
+                segment_gradient,
+                segment_ids,
+                valid_tokens,
+            ).detach(),
+            "stages": stages,
+        }
+
+    def _build_model_diagnostics(
+        self,
+        *,
+        x: Tensor,
+        logits: Tensor,
+        input_ids: Tensor,
+        position_signal: Tensor,
+        attention_mask: Tensor | None,
+        segment_ids: Tensor,
+        valid_tokens: Tensor,
+        layer_diagnostics: list[dict[str, object]],
+        stage_states: list[Tensor],
+    ) -> dict[str, object]:
+        segment_token_counts = torch.stack(
+            [
+                (valid_tokens & segment_ids.eq(segment)).sum()
+                for segment in range(NUM_SEGMENTS)
+            ]
+        ).detach()
+        final_state_rms = Block._rms_by_segment(
+            x.detach().float(),
+            segment_ids,
+            valid_tokens,
+        ).detach()
+        log_probabilities = logits.detach().float().log_softmax(dim=-1)
+        probabilities = log_probabilities.exp()
+        logit_entropy = -(probabilities * log_probabilities).sum(dim=-1)
+        final_logit_entropy = self._debug_segment_means(
+            logit_entropy,
+            segment_ids,
+            valid_tokens,
+        ).detach()
+
+        stage_logits = [
+            {
+                "step": step,
+                "logits": self.head(self.final_norm(state)).detach(),
+            }
+            for step, state in enumerate(stage_states)
+        ]
+
+        base_token_state = self.token_embedding(input_ids)
+        zero_segment_x, _, _ = self._run_processor(
+            base_token_state,
+            position_signal,
+            attention_mask,
+        )
+        counterfactual_states = {"zero": zero_segment_x}
+        counterfactual_mappings = {
+            "permuted": (0, 2, 3, 1, 4),
+            "zero_nx": (0, 0, 0, 3, 4),
+            "zero_t": (0, 1, 2, 0, 4),
+            "swap_n_x": (0, 2, 1, 3, 4),
+        }
+        for name, mapping in counterfactual_mappings.items():
+            mapping_tensor = torch.tensor(
+                mapping,
+                dtype=torch.long,
+                device=segment_ids.device,
+            )
+            remapped_state = base_token_state + self.segment_embedding(
+                mapping_tensor[segment_ids]
+            )
+            counterfactual_x, _, _ = self._run_processor(
+                remapped_state,
+                position_signal,
+                attention_mask,
+            )
+            counterfactual_states[name] = counterfactual_x
+
+        return {
+            "segment_token_counts": segment_token_counts,
+            "segment_embedding": self._debug_segment_embedding_stats(),
+            "parameter_stats": self._debug_parameter_stats(),
+            "final_state_rms_by_segment": final_state_rms,
+            "final_logit_entropy_by_segment": final_logit_entropy,
+            "layers": layer_diagnostics,
+            "stage_logits": stage_logits,
+            "segment_counterfactual_logits": {
+                name: self.head(self.final_norm(state)).detach()
+                for name, state in counterfactual_states.items()
+            },
+        }
+
     def forward(
         self,
         input_ids: Tensor,
@@ -364,42 +1084,83 @@ class Model(nn.Module):
     ) -> tuple[Tensor, object]:
         positions = torch.arange(input_ids.shape[1], device=input_ids.device)
         position_signal = self.position_embedding(positions)
-        token_state = self.token_embedding(input_ids)
-        if self.use_act:
-            collect_act_diagnostics = (
-                self.collect_act_diagnostics if DBUG else False
-            )
-            x, ponder_cost, act_diagnostics = self.processor(
-                token_state,
-                position_signal,
-                attention_mask,
-                collect_act_diagnostics=collect_act_diagnostics,
-            )
-        else:
-            batch_size = input_ids.shape[0]
-            prompt_memory = token_state + position_signal
-            control_state = self.control_token.view(1, 1, -1).expand(
-                batch_size, -1, -1
-            )
-            workspace_state = prompt_memory + self.workspace_token.view(1, 1, -1)
-            work_state = torch.cat((control_state, workspace_state), dim=1)
-            work_state = self.processor(
-                prompt_memory,
-                work_state,
-                attention_mask,
-            )
-            x = work_state[:, 1:]
-            ponder_cost = x.new_zeros(())
-            act_diagnostics = None
+        segment_markers = (
+            input_ids.eq(N_TOKEN_ID).long()
+            + 2 * input_ids.eq(X_TOKEN_ID).long()
+            + 3 * input_ids.eq(T_TOKEN_ID).long()
+            + 4 * input_ids.eq(ANS_TOKEN_ID).long()
+        )
+        valid_tokens = input_ids.ne(PAD_TOKEN_ID)
+        if attention_mask is not None and attention_mask.shape == input_ids.shape:
+            valid_tokens = attention_mask.bool()
+        segment_markers = segment_markers * valid_tokens.long()
+        segment_ids = segment_markers.cummax(dim=1).values
+        segment_ids = segment_ids.masked_fill(~valid_tokens, 0)
+        segment_signal = self.segment_embedding(segment_ids)
+        collect_training_diagnostics = (
+            DBUG
+            and self.training
+            and torch.is_grad_enabled()
+            and self.collect_training_diagnostics
+        )
+        if collect_training_diagnostics:
+            self._debug_training_context = None
+            segment_signal.retain_grad()
+        token_state = self.token_embedding(input_ids) + segment_signal
+        collect_act_diagnostics = (
+            self.collect_act_diagnostics if DBUG else False
+        )
+        collect_model_diagnostics = (
+            self.collect_model_diagnostics if DBUG else False
+        )
+        layer_diagnostics = [] if collect_model_diagnostics else None
+        stage_states = [] if collect_model_diagnostics else None
+        training_stage_states = [] if collect_training_diagnostics else None
+        x, ponder_cost, act_diagnostics = self._run_processor(
+            token_state,
+            position_signal,
+            attention_mask,
+            segment_ids=(segment_ids if collect_model_diagnostics else None),
+            collect_act_diagnostics=collect_act_diagnostics,
+            layer_diagnostics=layer_diagnostics,
+            stage_states=stage_states,
+            training_stage_states=training_stage_states,
+        )
+        if collect_training_diagnostics:
+            assert training_stage_states is not None
+            self._debug_training_context = {
+                "segment_signal": segment_signal,
+                "segment_ids": segment_ids.detach(),
+                "valid_tokens": valid_tokens.detach(),
+                "training_stage_states": training_stage_states,
+                "synchronized": not self.use_act,
+            }
         logits = self.head(self.final_norm(x))
         if not DBUG:
             return logits, ponder_cost
 
         if act_diagnostics is not None:
             act_diagnostics["ponder_weight"] = PONDER_WEIGHT
+        model_diagnostics = None
+        if collect_model_diagnostics:
+            assert layer_diagnostics is not None
+            assert stage_states is not None
+            with torch.no_grad():
+                model_diagnostics = self._build_model_diagnostics(
+                    x=x,
+                    logits=logits,
+                    input_ids=input_ids,
+                    position_signal=position_signal,
+                    attention_mask=attention_mask,
+                    segment_ids=segment_ids,
+                    valid_tokens=valid_tokens,
+                    layer_diagnostics=layer_diagnostics,
+                    stage_states=stage_states,
+                )
         auxiliary = {
             "ponder_cost": ponder_cost,
             "act": act_diagnostics,
+            "model_diagnostics": model_diagnostics,
         }
         return logits, auxiliary
 
@@ -407,10 +1168,92 @@ class Model(nn.Module):
 def build_model(spec: ModelSpec) -> Model:
     model = Model(spec, use_act=USE_ACT)
     assert_model_state(model, spec)
+    if DBUG:
+        total_parameters = sum(
+            parameter.numel() for parameter in model.parameters()
+        )
+        print(f"TOTAL_PARAMETERS: {total_parameters:,}")
+        print(
+            "Constants\n"
+            f" D_MODEL: {D_MODEL}, NUM_HEADS: {NUM_HEADS}, D_FF: {D_FF}, "
+            f"PONDER_WEIGHT: {PONDER_WEIGHT}, USE_ACT: {USE_ACT}, "
+            f"FIXED_LOOPS: {FIXED_LOOPS}, ACT_MAX_LOOPS: {ACT_MAX_LOOPS}, "
+            f"ACT_TAIL_HALT_FRACTION: {ACT_TAIL_HALT_FRACTION}, "
+            f"USE_MUON: {USE_MUON}, MUON_LR: {MUON_LR}, "
+            f"MUON_MOMENTUM: {MUON_MOMENTUM}, "
+            f"MUON_WEIGHT_DECAY: {MUON_WEIGHT_DECAY}, "
+            f"MUON_ADJUST_LR_FN: {MUON_ADJUST_LR_FN}, DBUG: {DBUG}"
+        )
     return model
 
 
+class CombinedOptimizer:
+    def __init__(self, optimizers: list[torch.optim.Optimizer]) -> None:
+        self.optimizers = optimizers
+
+    @property
+    def param_groups(self) -> list[dict]:
+        return [
+            group
+            for optimizer in self.optimizers
+            for group in optimizer.param_groups
+        ]
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        for optimizer in self.optimizers:
+            optimizer.zero_grad(set_to_none=set_to_none)
+
+    def step(self, closure=None):
+        result = None
+        for optimizer in self.optimizers:
+            value = (
+                optimizer.step(closure=closure)
+                if closure is not None
+                else optimizer.step()
+            )
+            if value is not None:
+                result = value
+        return result
+
+    def state_dict(self) -> dict:
+        return {
+            "optimizers": [
+                optimizer.state_dict() for optimizer in self.optimizers
+            ]
+        }
+
+
 def build_optimizer(model: nn.Module, spec: OptimizerSpec) -> OptimizerBundle:
+    if USE_MUON:
+        muon_parameters = []
+        adamw_parameters = []
+        for name, parameter in model.named_parameters():
+            use_muon = (
+                parameter.ndim == 2
+                and name.startswith("processor.block.")
+                and name.endswith(".weight")
+            )
+            if use_muon:
+                muon_parameters.append(parameter)
+            else:
+                adamw_parameters.append(parameter)
+
+        muon = torch.optim.Muon(
+            muon_parameters,
+            lr=MUON_LR,
+            momentum=MUON_MOMENTUM,
+            weight_decay=MUON_WEIGHT_DECAY,
+            adjust_lr_fn=MUON_ADJUST_LR_FN,
+        )
+        adamw = torch.optim.AdamW(
+            adamw_parameters,
+            lr=1e-3,
+            betas=(0.9, 0.95),
+            weight_decay=0.1,
+            capturable=spec.device_type == "cuda",
+        )
+        return OptimizerBundle(CombinedOptimizer([muon, adamw]))
+
     return OptimizerBundle(
         torch.optim.AdamW(
             model.parameters(),
