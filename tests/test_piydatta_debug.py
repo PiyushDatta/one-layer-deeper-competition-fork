@@ -523,6 +523,40 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
         self.assertFalse(final_step_diagnostics["tail_forced_mask"].any())
         self.assertTrue(final_step_diagnostics["cap_forced_mask"][0, 9])
 
+    def test_cosine_decay_scheduler_updates_every_optimizer_group(self) -> None:
+        first_parameter = torch.nn.Parameter(torch.tensor(1.0))
+        second_parameter = torch.nn.Parameter(torch.tensor(1.0))
+        first_optimizer = torch.optim.SGD([first_parameter], lr=0.1)
+        second_optimizer = torch.optim.AdamW([second_parameter], lr=0.01)
+        optimizer = self.namespace["CombinedOptimizer"](
+            [first_optimizer, second_optimizer]
+        )
+        scheduler = self.namespace["CosineDecayScheduler"](
+            optimizer,
+            start_step=2,
+            end_step=4,
+            min_factor=0.0,
+        )
+
+        scheduler.step()
+        self.assertEqual(
+            [group["lr"] for group in optimizer.param_groups],
+            [0.1, 0.01],
+        )
+        scheduler.step()
+        self.assertEqual(
+            [group["lr"] for group in optimizer.param_groups],
+            [0.1, 0.01],
+        )
+        scheduler.step()
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 0.05)
+        self.assertAlmostEqual(optimizer.param_groups[1]["lr"], 0.005)
+        scheduler.step()
+        self.assertEqual(
+            [group["lr"] for group in optimizer.param_groups],
+            [0.0, 0.0],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

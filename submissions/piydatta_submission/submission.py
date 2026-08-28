@@ -26,6 +26,9 @@ MUON_LR = 1e-3
 MUON_MOMENTUM = 0.95
 MUON_WEIGHT_DECAY = 0.1
 MUON_ADJUST_LR_FN = "match_rms_adamw"
+LR_DECAY_START_STEP = 200
+LR_DECAY_END_STEP = 400
+LR_DECAY_MIN_FACTOR = 0.0
 DBUG = False
 
 PAD_TOKEN_ID = 0
@@ -1182,7 +1185,10 @@ def build_model(spec: ModelSpec) -> Model:
             f"USE_MUON: {USE_MUON}, MUON_LR: {MUON_LR}, "
             f"MUON_MOMENTUM: {MUON_MOMENTUM}, "
             f"MUON_WEIGHT_DECAY: {MUON_WEIGHT_DECAY}, "
-            f"MUON_ADJUST_LR_FN: {MUON_ADJUST_LR_FN}, DBUG: {DBUG}"
+            f"MUON_ADJUST_LR_FN: {MUON_ADJUST_LR_FN}, "
+            f"LR_DECAY_START_STEP: {LR_DECAY_START_STEP}, "
+            f"LR_DECAY_END_STEP: {LR_DECAY_END_STEP}, "
+            f"LR_DECAY_MIN_FACTOR: {LR_DECAY_MIN_FACTOR}, DBUG: {DBUG}"
         )
     return model
 
@@ -1223,6 +1229,51 @@ class CombinedOptimizer:
         }
 
 
+class CosineDecayScheduler:
+    def __init__(
+        self,
+        optimizer,
+        *,
+        start_step: int,
+        end_step: int,
+        min_factor: float,
+    ) -> None:
+        if start_step < 0:
+            raise ValueError("decay start step must be non-negative")
+        if end_step <= start_step:
+            raise ValueError("decay end step must be after the start step")
+        if not 0.0 <= min_factor <= 1.0:
+            raise ValueError("minimum learning-rate factor must be in [0, 1]")
+
+        self.optimizer = optimizer
+        self.start_step = start_step
+        self.end_step = end_step
+        self.min_factor = min_factor
+        self.completed_steps = 0
+        self.base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+
+    def step(self) -> None:
+        self.completed_steps += 1
+        if self.completed_steps <= self.start_step:
+            factor = 1.0
+        elif self.completed_steps >= self.end_step:
+            factor = self.min_factor
+        else:
+            progress = (
+                (self.completed_steps - self.start_step)
+                / (self.end_step - self.start_step)
+            )
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            factor = self.min_factor + (1.0 - self.min_factor) * cosine
+
+        for group, base_lr in zip(
+            self.optimizer.param_groups,
+            self.base_lrs,
+            strict=True,
+        ):
+            group["lr"] = base_lr * factor
+
+
 def build_optimizer(model: nn.Module, spec: OptimizerSpec) -> OptimizerBundle:
     if USE_MUON:
         muon_parameters = []
@@ -1252,17 +1303,29 @@ def build_optimizer(model: nn.Module, spec: OptimizerSpec) -> OptimizerBundle:
             weight_decay=0.1,
             capturable=spec.device_type == "cuda",
         )
-        return OptimizerBundle(CombinedOptimizer([muon, adamw]))
-
-    return OptimizerBundle(
-        torch.optim.AdamW(
-            model.parameters(),
-            lr=1e-3,
-            betas=(0.9, 0.95),
-            weight_decay=0.1,
-            capturable=spec.device_type == "cuda",
+        optimizer = CombinedOptimizer([muon, adamw])
+        scheduler = CosineDecayScheduler(
+            optimizer,
+            start_step=LR_DECAY_START_STEP,
+            end_step=LR_DECAY_END_STEP,
+            min_factor=LR_DECAY_MIN_FACTOR,
         )
+        return OptimizerBundle(optimizer, scheduler=scheduler)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=1e-3,
+        betas=(0.9, 0.95),
+        weight_decay=0.1,
+        capturable=spec.device_type == "cuda",
     )
+    scheduler = CosineDecayScheduler(
+        optimizer,
+        start_step=LR_DECAY_START_STEP,
+        end_step=LR_DECAY_END_STEP,
+        min_factor=LR_DECAY_MIN_FACTOR,
+    )
+    return OptimizerBundle(optimizer, scheduler=scheduler)
 
 
 SUBMISSION = Submission(
