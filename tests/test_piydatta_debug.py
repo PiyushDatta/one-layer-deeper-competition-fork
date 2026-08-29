@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 
-from benchmark import ModelSpec
+from benchmark import ModelSpec, TokenLossBatch
 from benchmark.runner import _load_submission_file
 
 
@@ -28,7 +28,7 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.namespace["DBUG"] = self.original_debug_setting
 
-    def test_final_path_returns_only_the_scalar_ponder_cost(self) -> None:
+    def test_final_path_only_keeps_training_hypothesis_tensors(self) -> None:
         self.namespace["DBUG"] = False
         model = self.model_class(self.spec, use_act=True)
         self.assertFalse(hasattr(model, "collect_act_diagnostics"))
@@ -36,6 +36,7 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
         self.assertFalse(hasattr(model, "collect_training_diagnostics"))
         self.assertFalse(hasattr(model, "_debug_initial_parameter_buffers"))
 
+        model.eval()
         logits, auxiliary = model(self.input_ids, self.attention_mask)
 
         self.assertEqual(logits.shape, (1, 4, 17))
@@ -43,12 +44,27 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
         self.assertEqual(auxiliary.ndim, 0)
 
         fixed_model = self.model_class(self.spec, use_act=False)
-        _, fixed_auxiliary = fixed_model(
+        fixed_model.train()
+        _, training_auxiliary = fixed_model(
             self.input_ids, self.attention_mask
         )
         self.assertFalse(hasattr(fixed_model, "collect_act_diagnostics"))
         self.assertFalse(hasattr(fixed_model, "collect_model_diagnostics"))
         self.assertFalse(hasattr(fixed_model, "collect_training_diagnostics"))
+        self.assertIsInstance(training_auxiliary, dict)
+        self.assertEqual(
+            training_auxiliary["hypothesis_logits"].shape,
+            (1, fixed_model.max_loops, 4, 17),
+        )
+        self.assertEqual(
+            training_auxiliary["hypothesis_log_prior"].shape,
+            (fixed_model.max_loops,),
+        )
+
+        fixed_model.eval()
+        _, fixed_auxiliary = fixed_model(
+            self.input_ids, self.attention_mask
+        )
         self.assertTrue(torch.is_tensor(fixed_auxiliary))
         self.assertEqual(fixed_auxiliary.ndim, 0)
 
@@ -180,8 +196,17 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
         model.train()
         model.collect_training_diagnostics = True
 
-        logits, _ = model(self.input_ids, self.attention_mask)
-        logits[self.attention_mask].square().mean().backward()
+        logits, auxiliary = model(self.input_ids, self.attention_mask)
+        loss = self.namespace["token_training_loss"](
+            TokenLossBatch(
+                logits=logits[:, :3],
+                labels=torch.tensor([[1, 2, 3]]),
+                valid_mask=torch.ones(1, 3, dtype=torch.bool),
+                target_positions=torch.tensor([[0, 1, 2]]),
+                auxiliary=auxiliary,
+            )
+        )
+        loss.backward()
         diagnostics = model.consume_training_grad_diagnostics()
 
         self.assertEqual(len(diagnostics["stages"]), model.max_loops + 1)
@@ -297,7 +322,12 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
         )
         logits, auxiliary = model(self.input_ids, self.attention_mask)
         self.assertEqual(logits.shape, (1, 4, 17))
-        self.assertEqual(auxiliary.item(), 0.0)
+        self.assertIsInstance(auxiliary, dict)
+        self.assertEqual(auxiliary["ponder_cost"].item(), 0.0)
+        self.assertEqual(
+            auxiliary["hypothesis_logits"].shape,
+            (1, model.max_loops, 4, 17),
+        )
 
     def test_act_and_fixed_modes_share_common_initialization(self) -> None:
         self.namespace["DBUG"] = False
@@ -339,9 +369,21 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
                 self.prompt_memory = None
                 self.work_state = None
 
-            def forward(self, prompt_memory, work_state, attention_mask):
+            def forward(
+                self,
+                prompt_memory,
+                work_state,
+                attention_mask,
+                *,
+                hypothesis_states=None,
+                **kwargs,
+            ):
                 self.prompt_memory = prompt_memory.detach().clone()
                 self.work_state = work_state.detach().clone()
+                if hypothesis_states is not None:
+                    hypothesis_states.extend(
+                        [work_state[:, 1:]] * model.max_loops
+                    )
                 return work_state
 
         processor = RecordingProcessor()
@@ -556,6 +598,95 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
             [group["lr"] for group in optimizer.param_groups],
             [0.0, 0.0],
         )
+
+    def test_latent_hypothesis_loss_uses_only_valid_target_positions(self) -> None:
+        candidate_logits = torch.zeros(1, 2, 4, 3)
+        candidate_logits[0, 0, 1, 0] = 4.0
+        candidate_logits[0, 0, 3, 1] = 4.0
+        candidate_logits[0, 1, 1, 2] = 4.0
+        candidate_logits[0, 1, 3, 2] = 4.0
+        candidate_logits.requires_grad_()
+        hypothesis_prior = torch.tensor(
+            [0.2, -0.2],
+            requires_grad=True,
+        )
+        batch = TokenLossBatch(
+            logits=torch.zeros(1, 3, 3, requires_grad=True),
+            labels=torch.tensor([[0, 1, -100]]),
+            valid_mask=torch.tensor([[True, True, False]]),
+            target_positions=torch.tensor([[1, 3, -1]]),
+            auxiliary={
+                "ponder_cost": torch.zeros(()),
+                "hypothesis_logits": candidate_logits,
+                "hypothesis_log_prior": torch.log_softmax(
+                    hypothesis_prior,
+                    dim=0,
+                ),
+            },
+        )
+
+        loss = self.namespace["token_training_loss"](batch)
+        loss.backward()
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertGreater(candidate_logits.grad[:, :, 1].abs().sum(), 0)
+        self.assertGreater(candidate_logits.grad[:, :, 3].abs().sum(), 0)
+        self.assertEqual(candidate_logits.grad[:, :, 0].abs().sum(), 0)
+        self.assertEqual(candidate_logits.grad[:, :, 2].abs().sum(), 0)
+        self.assertGreater(hypothesis_prior.grad.abs().sum(), 0)
+        self.assertIsNone(batch.logits.grad)
+
+    def test_eval_uses_the_globally_selected_hypothesis(self) -> None:
+        self.namespace["DBUG"] = False
+        model = self.model_class(self.spec, use_act=False)
+        with torch.no_grad():
+            model.hypothesis_prior.copy_(torch.tensor([10.0, -10.0]))
+
+        model.train()
+        _, training_auxiliary = model(
+            self.input_ids,
+            self.attention_mask,
+        )
+        expected_logits = training_auxiliary["hypothesis_logits"][:, 0]
+
+        model.eval()
+        evaluation_logits, evaluation_auxiliary = model(
+            self.input_ids,
+            self.attention_mask,
+        )
+
+        torch.testing.assert_close(evaluation_logits, expected_logits)
+        self.assertTrue(torch.is_tensor(evaluation_auxiliary))
+        self.assertEqual(evaluation_auxiliary.ndim, 0)
+
+    def test_hypothesis_depth_penalty_prefers_the_earlier_exit(self) -> None:
+        candidate_logits = torch.zeros(
+            1,
+            2,
+            2,
+            3,
+            requires_grad=True,
+        )
+        hypothesis_prior = torch.zeros(2, requires_grad=True)
+        batch = TokenLossBatch(
+            logits=torch.zeros(1, 1, 3),
+            labels=torch.tensor([[0]]),
+            valid_mask=torch.tensor([[True]]),
+            target_positions=torch.tensor([[1]]),
+            auxiliary={
+                "ponder_cost": torch.zeros(()),
+                "hypothesis_logits": candidate_logits,
+                "hypothesis_log_prior": torch.log_softmax(
+                    hypothesis_prior,
+                    dim=0,
+                ),
+            },
+        )
+
+        self.namespace["token_training_loss"](batch).backward()
+
+        self.assertLess(hypothesis_prior.grad[0].item(), 0.0)
+        self.assertGreater(hypothesis_prior.grad[1].item(), 0.0)
 
 
 if __name__ == "__main__":

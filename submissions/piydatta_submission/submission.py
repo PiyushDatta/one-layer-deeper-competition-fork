@@ -10,6 +10,7 @@ from benchmark import (
     OptimizerBundle,
     OptimizerSpec,
     Submission,
+    TokenLossBatch,
 )
 from torch import nn, Tensor
 
@@ -29,6 +30,10 @@ MUON_ADJUST_LR_FN = "match_rms_adamw"
 LR_DECAY_START_STEP = 200
 LR_DECAY_END_STEP = 400
 LR_DECAY_MIN_FACTOR = 0.0
+USE_LATENT_HYPOTHESES = True
+HYPOTHESIS_TEMPERATURE = 1.0
+HYPOTHESIS_ALL_LOSS_WEIGHT = 0.25
+HYPOTHESIS_DEPTH_PENALTY = 0.01
 DBUG = False
 
 PAD_TOKEN_ID = 0
@@ -44,7 +49,92 @@ def training_loss(
     auxiliary: object,
 ) -> Tensor:
     task_loss = F.cross_entropy(logits, labels)
-    ponder_cost = auxiliary["ponder_cost"] if DBUG else auxiliary
+    ponder_cost = (
+        auxiliary["ponder_cost"]
+        if isinstance(auxiliary, dict)
+        else auxiliary
+    )
+    return task_loss + PONDER_WEIGHT * ponder_cost
+
+
+def _candidate_target_logits(
+    candidate_logits: Tensor,
+    batch: TokenLossBatch,
+) -> Tensor:
+    batch_size, candidate_count, _, vocab_size = candidate_logits.shape
+    if batch.target_positions is None:
+        candidate_target_logits = candidate_logits[:, :, :-1, :]
+        if candidate_target_logits.shape[2] != batch.labels.shape[1]:
+            raise ValueError("causal candidate logits do not match target length")
+        return candidate_target_logits
+
+    positions = batch.target_positions.clamp_min(0)
+    gather_positions = positions[:, None, :, None].expand(
+        batch_size,
+        candidate_count,
+        positions.shape[1],
+        vocab_size,
+    )
+    return candidate_logits.gather(2, gather_positions)
+
+
+def token_training_loss(batch: TokenLossBatch) -> Tensor:
+    if not isinstance(batch.auxiliary, dict):
+        raise TypeError("latent hypothesis training requires auxiliary tensors")
+
+    ponder_cost = batch.auxiliary["ponder_cost"]
+    candidate_logits = batch.auxiliary.get("hypothesis_logits")
+    hypothesis_log_prior = batch.auxiliary.get("hypothesis_log_prior")
+    if candidate_logits is None or hypothesis_log_prior is None:
+        task_loss = F.cross_entropy(
+            batch.logits[batch.valid_mask],
+            batch.labels[batch.valid_mask],
+        )
+        return task_loss + PONDER_WEIGHT * ponder_cost
+
+    candidate_target_logits = _candidate_target_logits(
+        candidate_logits,
+        batch,
+    )
+    batch_size, candidate_count, target_length, vocab_size = (
+        candidate_target_logits.shape
+    )
+    candidate_labels = batch.labels[:, None, :].expand(
+        batch_size,
+        candidate_count,
+        target_length,
+    )
+    token_losses = F.cross_entropy(
+        candidate_target_logits.reshape(-1, vocab_size),
+        candidate_labels.reshape(-1),
+        reduction="none",
+    ).view(batch_size, candidate_count, target_length)
+
+    candidate_valid_mask = batch.valid_mask[:, None, :]
+    target_counts = candidate_valid_mask.sum(dim=-1).clamp_min(1)
+    sequence_losses = (
+        (token_losses * candidate_valid_mask).sum(dim=-1)
+        / target_counts
+    )
+    rows_with_targets = batch.valid_mask.any(dim=-1)
+    candidate_evidence = sequence_losses[rows_with_targets].mean(dim=0)
+    depth_cost = HYPOTHESIS_DEPTH_PENALTY * torch.arange(
+        candidate_count,
+        device=candidate_evidence.device,
+        dtype=candidate_evidence.dtype,
+    )
+    selection_evidence = candidate_evidence + depth_cost
+
+    temperature = HYPOTHESIS_TEMPERATURE
+    survivor_loss = -temperature * torch.logsumexp(
+        hypothesis_log_prior - selection_evidence / temperature,
+        dim=0,
+    )
+    all_candidate_loss = candidate_evidence.mean()
+    task_loss = (
+        (1.0 - HYPOTHESIS_ALL_LOSS_WEIGHT) * survivor_loss
+        + HYPOTHESIS_ALL_LOSS_WEIGHT * all_candidate_loss
+    )
     return task_loss + PONDER_WEIGHT * ponder_cost
 
 
@@ -359,6 +449,7 @@ class SynchronizedProcessor(nn.Module):
         layer_diagnostics: list[dict[str, object]] | None = None,
         stage_states: list[Tensor] | None = None,
         training_stage_states: list[Tensor] | None = None,
+        hypothesis_states: list[Tensor] | None = None,
     ) -> Tensor:
         batch_size, prompt_len, _ = prompt_memory.shape
         if work_state.shape[:2] != (batch_size, prompt_len + 1):
@@ -446,6 +537,8 @@ class SynchronizedProcessor(nn.Module):
             if training_stage_states is not None:
                 work_state.retain_grad()
                 training_stage_states.append(work_state)
+            if hypothesis_states is not None:
+                hypothesis_states.append(work_state[:, 1:])
 
         return work_state
 
@@ -783,6 +876,11 @@ class Model(nn.Module):
                 block,
                 num_loops=self.max_loops,
             )
+            if USE_LATENT_HYPOTHESES:
+                self.hypothesis_prior = nn.Parameter(
+                    torch.empty(self.max_loops)
+                )
+                nn.init.normal_(self.hypothesis_prior, std=init_std)
 
         if DBUG:
             self._debug_initial_parameter_buffers = {}
@@ -809,6 +907,7 @@ class Model(nn.Module):
         layer_diagnostics: list[dict[str, object]] | None = None,
         stage_states: list[Tensor] | None = None,
         training_stage_states: list[Tensor] | None = None,
+        hypothesis_states: list[Tensor] | None = None,
     ) -> tuple[Tensor, Tensor, dict[str, object] | None]:
         if self.use_act:
             processor_kwargs = {
@@ -842,7 +941,11 @@ class Model(nn.Module):
         )
         workspace_state = prompt_memory + self.workspace_token.view(1, 1, -1)
         work_state = torch.cat((control_state, workspace_state), dim=1)
-        if layer_diagnostics is None and training_stage_states is None:
+        if (
+            layer_diagnostics is None
+            and training_stage_states is None
+            and hypothesis_states is None
+        ):
             work_state = self.processor(
                 prompt_memory,
                 work_state,
@@ -857,6 +960,7 @@ class Model(nn.Module):
                 layer_diagnostics=layer_diagnostics,
                 stage_states=stage_states,
                 training_stage_states=training_stage_states,
+                hypothesis_states=hypothesis_states,
             )
         x = work_state[:, 1:]
         return x, x.new_zeros(()), None
@@ -1119,6 +1223,11 @@ class Model(nn.Module):
         layer_diagnostics = [] if collect_model_diagnostics else None
         stage_states = [] if collect_model_diagnostics else None
         training_stage_states = [] if collect_training_diagnostics else None
+        hypothesis_states = (
+            []
+            if USE_LATENT_HYPOTHESES and not self.use_act
+            else None
+        )
         x, ponder_cost, act_diagnostics = self._run_processor(
             token_state,
             position_signal,
@@ -1128,6 +1237,7 @@ class Model(nn.Module):
             layer_diagnostics=layer_diagnostics,
             stage_states=stage_states,
             training_stage_states=training_stage_states,
+            hypothesis_states=hypothesis_states,
         )
         if collect_training_diagnostics:
             assert training_stage_states is not None
@@ -1138,8 +1248,40 @@ class Model(nn.Module):
                 "training_stage_states": training_stage_states,
                 "synchronized": not self.use_act,
             }
-        logits = self.head(self.final_norm(x))
+        hypothesis_logits = None
+        hypothesis_log_prior = None
+        if hypothesis_states is not None:
+            if len(hypothesis_states) != self.max_loops:
+                raise RuntimeError("processor did not produce every hypothesis")
+            stacked_hypothesis_states = torch.stack(
+                hypothesis_states,
+                dim=1,
+            )
+            hypothesis_logits = torch.stack(
+                [
+                    self.head(self.final_norm(state))
+                    for state in hypothesis_states
+                ],
+                dim=1,
+            )
+            hypothesis_log_prior = F.log_softmax(
+                self.hypothesis_prior,
+                dim=0,
+            )
+            winning_hypothesis = self.hypothesis_prior.argmax(dim=0)
+            x = stacked_hypothesis_states[:, winning_hypothesis]
+            logits = hypothesis_logits[:, winning_hypothesis]
+        else:
+            logits = self.head(self.final_norm(x))
+
+        training_auxiliary = {
+            "ponder_cost": ponder_cost,
+            "hypothesis_logits": hypothesis_logits,
+            "hypothesis_log_prior": hypothesis_log_prior,
+        }
         if not DBUG:
+            if self.training:
+                return logits, training_auxiliary
             return logits, ponder_cost
 
         if act_diagnostics is not None:
@@ -1164,6 +1306,8 @@ class Model(nn.Module):
             "ponder_cost": ponder_cost,
             "act": act_diagnostics,
             "model_diagnostics": model_diagnostics,
+            "hypothesis_logits": hypothesis_logits,
+            "hypothesis_log_prior": hypothesis_log_prior,
         }
         return logits, auxiliary
 
@@ -1188,7 +1332,13 @@ def build_model(spec: ModelSpec) -> Model:
             f"MUON_ADJUST_LR_FN: {MUON_ADJUST_LR_FN}, "
             f"LR_DECAY_START_STEP: {LR_DECAY_START_STEP}, "
             f"LR_DECAY_END_STEP: {LR_DECAY_END_STEP}, "
-            f"LR_DECAY_MIN_FACTOR: {LR_DECAY_MIN_FACTOR}, DBUG: {DBUG}"
+            f"LR_DECAY_MIN_FACTOR: {LR_DECAY_MIN_FACTOR}, "
+            f"USE_LATENT_HYPOTHESES: {USE_LATENT_HYPOTHESES}, "
+            f"HYPOTHESIS_TEMPERATURE: {HYPOTHESIS_TEMPERATURE}, "
+            f"HYPOTHESIS_ALL_LOSS_WEIGHT: "
+            f"{HYPOTHESIS_ALL_LOSS_WEIGHT}, "
+            f"HYPOTHESIS_DEPTH_PENALTY: {HYPOTHESIS_DEPTH_PENALTY}, "
+            f"DBUG: {DBUG}"
         )
     return model
 
@@ -1331,5 +1481,5 @@ def build_optimizer(model: nn.Module, spec: OptimizerSpec) -> OptimizerBundle:
 SUBMISSION = Submission(
     build_model=build_model,
     build_optimizer=build_optimizer,
-    training_loss=training_loss,
+    token_training_loss=token_training_loss,
 )
