@@ -274,19 +274,44 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
                 return candidate
 
         block = RecordingBlock()
-        processor = processor_class(block, num_loops=2)
+        scratchpad_tokens = 2
+        processor = processor_class(
+            block,
+            num_loops=2,
+            num_scratchpad_tokens=scratchpad_tokens,
+        )
         prompt_memory = torch.randn(1, prompt_len, width)
-        work_state = torch.zeros(1, prompt_len + 1, width)
+        work_state = torch.zeros(
+            1,
+            prompt_len + 1 + scratchpad_tokens,
+            width,
+        )
         attention_mask = torch.tensor([[True, False]])
+        stage_states = []
+        hypothesis_states = []
 
-        result = processor(prompt_memory, work_state, attention_mask)
+        result = processor(
+            prompt_memory,
+            work_state,
+            attention_mask,
+            stage_states=stage_states,
+            hypothesis_states=hypothesis_states,
+        )
 
         self.assertEqual(len(block.prompt_inputs), 2)
         torch.testing.assert_close(block.prompt_inputs[0], prompt_memory)
         torch.testing.assert_close(block.prompt_inputs[1], prompt_memory)
         torch.testing.assert_close(result, torch.full_like(result, 2.0))
+        self.assertEqual(
+            [state.shape for state in stage_states],
+            [(1, prompt_len, width)] * 3,
+        )
+        self.assertEqual(
+            [state.shape for state in hypothesis_states],
+            [(1, prompt_len, width)] * 2,
+        )
         expected_joint_mask = torch.tensor(
-            [[True, False, True, True, False]]
+            [[True, False, True, True, False, True, True]]
         )
         torch.testing.assert_close(block.masks[0], expected_joint_mask)
         torch.testing.assert_close(block.masks[1], expected_joint_mask)
@@ -309,6 +334,44 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
 
         self.assertGreater(prompt_memory.grad.abs().sum().item(), 0.0)
         self.assertGreater(work_state.grad.abs().sum().item(), 0.0)
+
+    def test_synchronized_processor_reads_scratch_on_the_next_loop(self) -> None:
+        width = self.namespace["D_MODEL"]
+        processor_class = self.namespace["SynchronizedProcessor"]
+        prompt_len = 1
+
+        class ScratchReadWriteBlock(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.call_count = 0
+
+            def forward(self, x, attention_mask):
+                del attention_mask
+                candidate = x.clone()
+                aligned_index = prompt_len + 1
+                scratch_index = aligned_index + prompt_len
+                if self.call_count == 0:
+                    candidate[:, scratch_index, 0] = x[:, 0, 0]
+                else:
+                    candidate[:, aligned_index, 0] = x[:, scratch_index, 0]
+                self.call_count += 1
+                return candidate
+
+        block = ScratchReadWriteBlock()
+        processor = processor_class(
+            block,
+            num_loops=2,
+            num_scratchpad_tokens=1,
+        )
+        prompt_memory = torch.zeros(1, prompt_len, width)
+        prompt_memory[:, 0, 0] = 7.0
+        work_state = torch.zeros(1, 1 + prompt_len + 1, width)
+
+        result = processor(prompt_memory, work_state)
+
+        self.assertEqual(block.call_count, 2)
+        self.assertEqual(result[0, 1, 0].item(), 7.0)
+        self.assertEqual(result[0, 2, 0].item(), 7.0)
 
     def test_default_model_uses_two_synchronized_loops(self) -> None:
         self.namespace["DBUG"] = False
@@ -381,8 +444,9 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
                 self.prompt_memory = prompt_memory.detach().clone()
                 self.work_state = work_state.detach().clone()
                 if hypothesis_states is not None:
+                    output_end = 1 + prompt_memory.shape[1]
                     hypothesis_states.extend(
-                        [work_state[:, 1:]] * model.max_loops
+                        [work_state[:, 1:output_end]] * model.max_loops
                     )
                 return work_state
 
@@ -410,8 +474,13 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
             expected_control,
         )
         torch.testing.assert_close(
-            processor.work_state[:, 1:],
+            processor.work_state[:, 1 : 1 + self.input_ids.shape[1]],
             expected_workspace,
+        )
+        expected_scratchpad = model.scratchpad_embedding.weight.unsqueeze(0)
+        torch.testing.assert_close(
+            processor.work_state[:, 1 + self.input_ids.shape[1] :],
+            expected_scratchpad,
         )
 
     def test_segment_embeddings_follow_prompt_fields(self) -> None:
@@ -485,6 +554,10 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
         self.assertGreater(model.control_token.grad.abs().sum().item(), 0.0)
         self.assertGreater(model.workspace_token.grad.abs().sum().item(), 0.0)
         self.assertGreater(
+            model.scratchpad_embedding.weight.grad.abs().sum().item(),
+            0.0,
+        )
+        self.assertGreater(
             model.token_embedding.weight.grad.abs().sum().item(),
             0.0,
         )
@@ -496,6 +569,18 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
             model.processor.block.qkv.weight.grad.abs().sum().item(),
             0.0,
         )
+
+    def test_synchronized_scratchpad_handles_an_all_padding_prompt(self) -> None:
+        self.namespace["DBUG"] = False
+        model = self.model_class(self.spec)
+        model.eval()
+        input_ids = torch.zeros(1, 4, dtype=torch.long)
+        attention_mask = torch.zeros(1, 4, dtype=torch.bool)
+
+        logits, _ = model(input_ids, attention_mask)
+
+        self.assertEqual(logits.shape, (1, 4, 17))
+        self.assertTrue(torch.isfinite(logits).all())
 
     def test_tail_cutoff_is_counted_per_example(self) -> None:
         self.namespace["DBUG"] = True

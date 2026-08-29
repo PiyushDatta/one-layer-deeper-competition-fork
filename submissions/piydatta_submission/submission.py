@@ -34,6 +34,7 @@ USE_LATENT_HYPOTHESES = True
 HYPOTHESIS_TEMPERATURE = 1.0
 HYPOTHESIS_ALL_LOSS_WEIGHT = 0.25
 HYPOTHESIS_DEPTH_PENALTY = 0.01
+NUM_SCRATCHPAD_TOKENS = 4
 DBUG = False
 
 PAD_TOKEN_ID = 0
@@ -432,12 +433,21 @@ class Block(nn.Module):
 
 
 class SynchronizedProcessor(nn.Module):
-    def __init__(self, block: Block, *, num_loops: int) -> None:
+    def __init__(
+        self,
+        block: Block,
+        *,
+        num_loops: int,
+        num_scratchpad_tokens: int = 0,
+    ) -> None:
         super().__init__()
         if num_loops < 1:
             raise ValueError("num_loops must be positive")
+        if num_scratchpad_tokens < 0:
+            raise ValueError("num_scratchpad_tokens must be non-negative")
         self.block = block
         self.num_loops = num_loops
+        self.num_scratchpad_tokens = num_scratchpad_tokens
 
     def forward(
         self,
@@ -452,10 +462,12 @@ class SynchronizedProcessor(nn.Module):
         hypothesis_states: list[Tensor] | None = None,
     ) -> Tensor:
         batch_size, prompt_len, _ = prompt_memory.shape
-        if work_state.shape[:2] != (batch_size, prompt_len + 1):
+        output_end = 1 + prompt_len
+        expected_work_len = output_end + self.num_scratchpad_tokens
+        if work_state.shape[:2] != (batch_size, expected_work_len):
             raise ValueError(
-                "work_state must contain one control token followed by one "
-                "work token per prompt position"
+                "work_state must contain one control token, one aligned work "
+                "token per prompt position, and the configured scratchpad tokens"
             )
 
         prompt_mask = torch.ones(
@@ -475,9 +487,17 @@ class SynchronizedProcessor(nn.Module):
             dtype=torch.bool,
             device=prompt_memory.device,
         )
-        work_mask = torch.cat((control_mask, prompt_mask), dim=1)
+        scratchpad_mask = torch.ones(
+            batch_size,
+            self.num_scratchpad_tokens,
+            dtype=torch.bool,
+            device=prompt_memory.device,
+        )
+        work_mask = torch.cat(
+            (control_mask, prompt_mask, scratchpad_mask),
+            dim=1,
+        )
         if attention_mask is not None:
-            work_mask = torch.cat((control_mask, prompt_mask), dim=1)
             joint_mask = torch.cat((prompt_mask, work_mask), dim=1)
 
         joint_segment_ids = None
@@ -496,7 +516,16 @@ class SynchronizedProcessor(nn.Module):
                 dtype=segment_ids.dtype,
                 device=segment_ids.device,
             )
-            work_segments = torch.cat((control_segments, segment_ids), dim=1)
+            scratchpad_segments = torch.zeros(
+                batch_size,
+                self.num_scratchpad_tokens,
+                dtype=segment_ids.dtype,
+                device=segment_ids.device,
+            )
+            work_segments = torch.cat(
+                (control_segments, segment_ids, scratchpad_segments),
+                dim=1,
+            )
             joint_segment_ids = torch.cat(
                 (segment_ids, work_segments),
                 dim=1,
@@ -504,12 +533,20 @@ class SynchronizedProcessor(nn.Module):
             prompt_streams = torch.zeros_like(segment_ids)
             control_stream = torch.ones_like(control_segments)
             work_streams = torch.full_like(segment_ids, 2)
+            # The public debug schema has three streams. Scratchpad slots are
+            # mutable work, so report them with the aligned workspace.
+            scratchpad_streams = torch.full_like(scratchpad_segments, 2)
             joint_stream_ids = torch.cat(
-                (prompt_streams, control_stream, work_streams),
+                (
+                    prompt_streams,
+                    control_stream,
+                    work_streams,
+                    scratchpad_streams,
+                ),
                 dim=1,
             )
         if stage_states is not None:
-            stage_states.append(work_state[:, 1:].detach())
+            stage_states.append(work_state[:, 1:output_end].detach())
         if training_stage_states is not None:
             work_state.retain_grad()
             training_stage_states.append(work_state)
@@ -533,12 +570,12 @@ class SynchronizedProcessor(nn.Module):
                 )
             work_state = candidate_state[:, prompt_len:]
             if stage_states is not None:
-                stage_states.append(work_state[:, 1:].detach())
+                stage_states.append(work_state[:, 1:output_end].detach())
             if training_stage_states is not None:
                 work_state.retain_grad()
                 training_stage_states.append(work_state)
             if hypothesis_states is not None:
-                hypothesis_states.append(work_state[:, 1:])
+                hypothesis_states.append(work_state[:, 1:output_end])
 
         return work_state
 
@@ -875,12 +912,20 @@ class Model(nn.Module):
             self.processor = SynchronizedProcessor(
                 block,
                 num_loops=self.max_loops,
+                num_scratchpad_tokens=NUM_SCRATCHPAD_TOKENS,
             )
             if USE_LATENT_HYPOTHESES:
                 self.hypothesis_prior = nn.Parameter(
                     torch.empty(self.max_loops)
                 )
                 nn.init.normal_(self.hypothesis_prior, std=init_std)
+            # Keep this after all existing fixed-path parameters so adding the
+            # scratchpad does not shift their seeded initialization.
+            self.scratchpad_embedding = nn.Embedding(
+                NUM_SCRATCHPAD_TOKENS,
+                D_MODEL,
+            )
+            nn.init.normal_(self.scratchpad_embedding.weight, std=init_std)
 
         if DBUG:
             self._debug_initial_parameter_buffers = {}
@@ -940,7 +985,15 @@ class Model(nn.Module):
             -1,
         )
         workspace_state = prompt_memory + self.workspace_token.view(1, 1, -1)
-        work_state = torch.cat((control_state, workspace_state), dim=1)
+        scratchpad_state = self.scratchpad_embedding.weight.unsqueeze(0).expand(
+            batch_size,
+            -1,
+            -1,
+        )
+        work_state = torch.cat(
+            (control_state, workspace_state, scratchpad_state),
+            dim=1,
+        )
         if (
             layer_diagnostics is None
             and training_stage_states is None
@@ -962,7 +1015,7 @@ class Model(nn.Module):
                 training_stage_states=training_stage_states,
                 hypothesis_states=hypothesis_states,
             )
-        x = work_state[:, 1:]
+        x = work_state[:, 1 : 1 + token_state.shape[1]]
         return x, x.new_zeros(()), None
 
     @staticmethod
@@ -1063,7 +1116,12 @@ class Model(nn.Module):
                 control_gradient_rms = (
                     state_gradient[:, :1].square().mean().sqrt().detach()
                 )
-                state_gradient = state_gradient[:, 1:]
+                # Existing segment diagnostics describe the output-aligned
+                # workspace. Scratchpad slots are deliberately not assigned a
+                # grammatical segment, so exclude them from these summaries.
+                state_gradient = state_gradient[
+                    :, 1 : 1 + valid_tokens.shape[1]
+                ]
             stages.append(
                 {
                     "step": step,
@@ -1338,6 +1396,7 @@ def build_model(spec: ModelSpec) -> Model:
             f"HYPOTHESIS_ALL_LOSS_WEIGHT: "
             f"{HYPOTHESIS_ALL_LOSS_WEIGHT}, "
             f"HYPOTHESIS_DEPTH_PENALTY: {HYPOTHESIS_DEPTH_PENALTY}, "
+            f"NUM_SCRATCHPAD_TOKENS: {NUM_SCRATCHPAD_TOKENS}, "
             f"DBUG: {DBUG}"
         )
     return model
