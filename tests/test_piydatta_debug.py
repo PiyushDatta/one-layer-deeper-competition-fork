@@ -5,7 +5,12 @@ from pathlib import Path
 
 import torch
 
-from benchmark import ModelSpec, TokenLossBatch
+from benchmark import (
+    count_model_state_elements,
+    ModelSpec,
+    OptimizerSpec,
+    TokenLossBatch,
+)
 from benchmark.runner import _load_submission_file
 
 
@@ -20,6 +25,14 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
         self.submission = _load_submission_file(SUBMISSION_PATH)
         self.namespace = self.submission.build_model.__globals__
         self.original_debug_setting = self.namespace["DBUG"]
+        # The shipped width costs ~2 GiB per model, and these tests cover wiring.
+        self.shipped_width = {
+            name: self.namespace[name]
+            for name in ("D_MODEL", "NUM_HEADS", "D_FF")
+        }
+        self.namespace["D_MODEL"] = 32
+        self.namespace["NUM_HEADS"] = 4
+        self.namespace["D_FF"] = 128
         self.model_class = self.namespace["Model"]
         self.spec = ModelSpec(17, 4, 1_000_000)
         self.input_ids = torch.tensor([[1, 2, 3, 0]])
@@ -27,6 +40,7 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.namespace["DBUG"] = self.original_debug_setting
+        self.namespace.update(self.shipped_width)
 
     def test_final_path_only_keeps_training_hypothesis_tensors(self) -> None:
         self.namespace["DBUG"] = False
@@ -650,7 +664,7 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
         self.assertFalse(final_step_diagnostics["tail_forced_mask"].any())
         self.assertTrue(final_step_diagnostics["cap_forced_mask"][0, 9])
 
-    def test_cosine_decay_scheduler_updates_every_optimizer_group(self) -> None:
+    def test_cosine_decay_scheduler_follows_the_wall_clock_budget(self) -> None:
         first_parameter = torch.nn.Parameter(torch.tensor(1.0))
         second_parameter = torch.nn.Parameter(torch.tensor(1.0))
         first_optimizer = torch.optim.SGD([first_parameter], lr=0.1)
@@ -658,31 +672,108 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
         optimizer = self.namespace["CombinedOptimizer"](
             [first_optimizer, second_optimizer]
         )
+        now = [0.0]
         scheduler = self.namespace["CosineDecayScheduler"](
             optimizer,
-            start_step=2,
-            end_step=4,
+            total_seconds=10.0,
+            hold_fraction=0.5,
             min_factor=0.0,
+            started_at=0.0,
+            clock=lambda: now[0],
         )
 
-        scheduler.step()
-        self.assertEqual(
-            [group["lr"] for group in optimizer.param_groups],
-            [0.1, 0.01],
-        )
-        scheduler.step()
-        self.assertEqual(
-            [group["lr"] for group in optimizer.param_groups],
-            [0.1, 0.01],
-        )
+        for elapsed in (0.0, 2.0, 5.0):
+            now[0] = elapsed
+            scheduler.step()
+            self.assertEqual(
+                [group["lr"] for group in optimizer.param_groups],
+                [0.1, 0.01],
+            )
+
+        now[0] = 7.5
         scheduler.step()
         self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 0.05)
         self.assertAlmostEqual(optimizer.param_groups[1]["lr"], 0.005)
+
+        now[0] = 10.0
         scheduler.step()
         self.assertEqual(
             [group["lr"] for group in optimizer.param_groups],
             [0.0, 0.0],
         )
+
+        # Overshooting the budget stays clamped at the floor.
+        now[0] = 99.0
+        scheduler.step()
+        self.assertEqual(
+            [group["lr"] for group in optimizer.param_groups],
+            [0.0, 0.0],
+        )
+
+    def test_scheduler_floor_is_positive_and_keyed_to_the_seed_budget(self) -> None:
+        self.namespace["DBUG"] = False
+        min_factor = self.namespace["LR_DECAY_MIN_FACTOR"]
+        self.assertGreater(min_factor, 0.0)
+
+        model = self.namespace["build_model"](self.spec)
+        bundle = self.submission.build_optimizer(
+            model,
+            OptimizerSpec(training_time_seconds=60.0, device_type="cpu"),
+        )
+        scheduler = bundle.scheduler
+
+        self.assertEqual(scheduler.total_seconds, 60.0)
+        self.assertEqual(
+            scheduler.started_at,
+            self.namespace["_SEED_STARTED_AT"],
+        )
+        # The floor is reached at the deadline, not at a fixed step number.
+        scheduler.clock = lambda: scheduler.started_at + 60.0
+        scheduler.step()
+        for group, base_lr in zip(
+            scheduler.optimizer.param_groups,
+            scheduler.base_lrs,
+            strict=True,
+        ):
+            self.assertAlmostEqual(group["lr"], base_lr * min_factor)
+            self.assertGreater(group["lr"], 0.0)
+
+    def test_build_model_materializes_on_the_accelerator(self) -> None:
+        self.namespace["DBUG"] = False
+        build_model = self.namespace["build_model"]
+
+        expected = self.namespace["_construction_device"]().type
+        model = build_model(self.spec)
+        for name, parameter in model.named_parameters():
+            with self.subTest(parameter=name):
+                self.assertEqual(parameter.device.type, expected)
+
+        original = self.namespace["BUILD_ON_ACCELERATOR"]
+        self.namespace["BUILD_ON_ACCELERATOR"] = False
+        try:
+            self.assertEqual(self.namespace["_construction_device"]().type, "cpu")
+            cpu_model = build_model(self.spec)
+            for name, parameter in cpu_model.named_parameters():
+                with self.subTest(parameter=name):
+                    self.assertEqual(parameter.device.type, "cpu")
+        finally:
+            self.namespace["BUILD_ON_ACCELERATOR"] = original
+
+    def test_shipped_width_stays_under_the_model_state_ceiling(self) -> None:
+        self.namespace.update(self.shipped_width)
+        self.namespace["DBUG"] = False
+        width = self.shipped_width["D_MODEL"]
+        self.assertEqual(width % self.shipped_width["NUM_HEADS"], 0)
+        self.assertEqual(self.shipped_width["D_FF"], 4 * width)
+
+        ceiling = 500_000_000
+        # The meta device counts the real shipped model without allocating it.
+        for max_seq_len in (13, 64):
+            with self.subTest(max_seq_len=max_seq_len), torch.device("meta"):
+                model = self.model_class(ModelSpec(17, max_seq_len, ceiling))
+            elements = count_model_state_elements(model)
+            self.assertLessEqual(elements, ceiling)
+            self.assertGreater(elements, 450_000_000)
 
     def test_latent_hypothesis_loss_uses_only_valid_target_positions(self) -> None:
         candidate_logits = torch.zeros(1, 2, 4, 3)

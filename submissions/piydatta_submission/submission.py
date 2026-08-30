@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 import torch
 import torch.nn.functional as F
@@ -14,12 +15,13 @@ from benchmark import (
 )
 from torch import nn, Tensor
 
-D_MODEL = 288
-NUM_HEADS = 9
+# State is 12 * D_MODEL**2 + ~53 * D_MODEL: 491,859,202 of the 500M ceiling.
+D_MODEL = 6400
+NUM_HEADS = 50  # head_dim 128
 D_FF = 4 * D_MODEL
 PONDER_WEIGHT = 0.005
 USE_ACT = False
-FIXED_LOOPS = 2
+FIXED_LOOPS = 7
 ACT_MAX_LOOPS = 16
 ACT_TAIL_HALT_FRACTION = None
 USE_MUON = True
@@ -27,15 +29,17 @@ MUON_LR = 1e-3
 MUON_MOMENTUM = 0.95
 MUON_WEIGHT_DECAY = 0.1
 MUON_ADJUST_LR_FN = "match_rms_adamw"
-LR_DECAY_START_STEP = 200
-LR_DECAY_END_STEP = 400
-LR_DECAY_MIN_FACTOR = 0.0
+# Fraction of the wall-clock budget, not a step count, so one value works at
+# every tier. Constant then a ~15% decay is the warmup-stable-decay shape.e
+LR_DECAY_HOLD_FRACTION = 0.85
+LR_DECAY_MIN_FACTOR = 0.001
 USE_LATENT_HYPOTHESES = True
 HYPOTHESIS_TEMPERATURE = 1.0
 HYPOTHESIS_ALL_LOSS_WEIGHT = 0.25
 HYPOTHESIS_DEPTH_PENALTY = 0.01
 NUM_SCRATCHPAD_TOKENS = 4
-DBUG = False
+BUILD_ON_ACCELERATOR = True
+DBUG = True
 
 PAD_TOKEN_ID = 0
 N_TOKEN_ID = 2
@@ -44,17 +48,14 @@ T_TOKEN_ID = 4
 ANS_TOKEN_ID = 5
 NUM_SEGMENTS = 5
 
+
 def training_loss(
     logits: Tensor,
     labels: Tensor,
     auxiliary: object,
 ) -> Tensor:
     task_loss = F.cross_entropy(logits, labels)
-    ponder_cost = (
-        auxiliary["ponder_cost"]
-        if isinstance(auxiliary, dict)
-        else auxiliary
-    )
+    ponder_cost = auxiliary["ponder_cost"] if isinstance(auxiliary, dict) else auxiliary
     return task_loss + PONDER_WEIGHT * ponder_cost
 
 
@@ -113,10 +114,7 @@ def token_training_loss(batch: TokenLossBatch) -> Tensor:
 
     candidate_valid_mask = batch.valid_mask[:, None, :]
     target_counts = candidate_valid_mask.sum(dim=-1).clamp_min(1)
-    sequence_losses = (
-        (token_losses * candidate_valid_mask).sum(dim=-1)
-        / target_counts
-    )
+    sequence_losses = (token_losses * candidate_valid_mask).sum(dim=-1) / target_counts
     rows_with_targets = batch.valid_mask.any(dim=-1)
     candidate_evidence = sequence_losses[rows_with_targets].mean(dim=0)
     depth_cost = HYPOTHESIS_DEPTH_PENALTY * torch.arange(
@@ -133,9 +131,8 @@ def token_training_loss(batch: TokenLossBatch) -> Tensor:
     )
     all_candidate_loss = candidate_evidence.mean()
     task_loss = (
-        (1.0 - HYPOTHESIS_ALL_LOSS_WEIGHT) * survivor_loss
-        + HYPOTHESIS_ALL_LOSS_WEIGHT * all_candidate_loss
-    )
+        1.0 - HYPOTHESIS_ALL_LOSS_WEIGHT
+    ) * survivor_loss + HYPOTHESIS_ALL_LOSS_WEIGHT * all_candidate_loss
     return task_loss + PONDER_WEIGHT * ponder_cost
 
 
@@ -195,9 +192,7 @@ class Block(nn.Module):
         x = x.transpose(1, 2).contiguous().view(batch, length, D_MODEL)
         attention_update = self.out(x)
         post_attention = residual + attention_update
-        mlp_update = self.down(
-            F.gelu(self.up(self.mixer_norm(post_attention)))
-        )
+        mlp_update = self.down(F.gelu(self.up(self.mixer_norm(post_attention))))
         output = post_attention + mlp_update
 
         if DBUG and layer_diagnostics is not None:
@@ -299,9 +294,7 @@ class Block(nn.Module):
                 device=device,
             )
         if key_stream_ids.shape != (batch_size, sequence_length):
-            raise ValueError(
-                "diagnostic key_stream_ids must match the block sequence"
-            )
+            raise ValueError("diagnostic key_stream_ids must match the block sequence")
 
         input_value = input_state.detach().float()
         attention_value = attention_update.detach().float()
@@ -353,8 +346,7 @@ class Block(nn.Module):
             )
         attention_probabilities = torch.nan_to_num(attention_probabilities)
         entropy_per_head = -(
-            attention_probabilities
-            * attention_probabilities.clamp_min(1e-12).log()
+            attention_probabilities * attention_probabilities.clamp_min(1e-12).log()
         ).sum(dim=-1)
         attention_entropy = cls._masked_mean(
             entropy_per_head.mean(dim=1),
@@ -377,23 +369,17 @@ class Block(nn.Module):
             for key_segment in range(NUM_SEGMENTS):
                 selected_keys = key_mask & segment_ids.eq(key_segment)
                 mass_per_query = (
-                    mean_attention
-                    * selected_keys[:, None, :].to(mean_attention.dtype)
+                    mean_attention * selected_keys[:, None, :].to(mean_attention.dtype)
                 ).sum(dim=-1)
-                key_masses.append(
-                    cls._masked_mean(mass_per_query, selected_queries)
-                )
+                key_masses.append(cls._masked_mean(mass_per_query, selected_queries))
             attention_mass_rows.append(torch.stack(key_masses))
             stream_masses = []
             for key_stream in range(3):
                 selected_keys = key_mask & key_stream_ids.eq(key_stream)
                 mass_per_query = (
-                    mean_attention
-                    * selected_keys[:, None, :].to(mean_attention.dtype)
+                    mean_attention * selected_keys[:, None, :].to(mean_attention.dtype)
                 ).sum(dim=-1)
-                stream_masses.append(
-                    cls._masked_mean(mass_per_query, selected_queries)
-                )
+                stream_masses.append(cls._masked_mean(mass_per_query, selected_queries))
             attention_stream_rows.append(torch.stack(stream_masses))
 
         state_change = output_value - input_value
@@ -414,15 +400,9 @@ class Block(nn.Module):
                 "input_output_cosine": input_output_cosine.detach(),
                 "attention_entropy": attention_entropy.detach(),
                 "effective_attended_tokens": effective_attended_tokens.detach(),
-                "segment_query_counts": torch.stack(
-                    segment_query_counts
-                ).detach(),
-                "attention_mass_by_segment": torch.stack(
-                    attention_mass_rows
-                ).detach(),
-                "attention_mass_by_stream": torch.stack(
-                    attention_stream_rows
-                ).detach(),
+                "segment_query_counts": torch.stack(segment_query_counts).detach(),
+                "attention_mass_by_segment": torch.stack(attention_mass_rows).detach(),
+                "attention_mass_by_stream": torch.stack(attention_stream_rows).detach(),
                 "state_change_rms_by_segment": cls._rms_by_segment(
                     state_change,
                     segment_ids,
@@ -733,9 +713,10 @@ class UniversalProcessor(nn.Module):
             curr_halt_prob = curr_halt_prob + update_prob
             weighted_output = weighted_output + update_prob * x
             if stage_states is not None:
-                provisional_output = weighted_output + (
-                    1.0 - curr_halt_prob
-                ) * valid_tokens.to(dtype=x.dtype) * x
+                provisional_output = (
+                    weighted_output
+                    + (1.0 - curr_halt_prob) * valid_tokens.to(dtype=x.dtype) * x
+                )
                 stage_states.append(provisional_output.detach())
             if not (valid_tokens & (curr_halt_prob < threshold)).any():
                 break
@@ -915,9 +896,7 @@ class Model(nn.Module):
                 num_scratchpad_tokens=NUM_SCRATCHPAD_TOKENS,
             )
             if USE_LATENT_HYPOTHESES:
-                self.hypothesis_prior = nn.Parameter(
-                    torch.empty(self.max_loops)
-                )
+                self.hypothesis_prior = nn.Parameter(torch.empty(self.max_loops))
                 nn.init.normal_(self.hypothesis_prior, std=init_std)
             # Keep this after all existing fixed-path parameters so adding the
             # scratchpad does not shift their seeded initialization.
@@ -930,9 +909,7 @@ class Model(nn.Module):
         if DBUG:
             self._debug_initial_parameter_buffers = {}
             with torch.no_grad():
-                for index, (name, parameter) in enumerate(
-                    self.named_parameters()
-                ):
+                for index, (name, parameter) in enumerate(self.named_parameters()):
                     buffer_name = f"_debug_initial_parameter_{index}"
                     self.register_buffer(
                         buffer_name,
@@ -958,10 +935,7 @@ class Model(nn.Module):
             processor_kwargs = {
                 "collect_act_diagnostics": collect_act_diagnostics,
             }
-            if (
-                layer_diagnostics is not None
-                or training_stage_states is not None
-            ):
+            if layer_diagnostics is not None or training_stage_states is not None:
                 processor_kwargs.update(
                     {
                         "segment_ids": segment_ids,
@@ -1045,16 +1019,12 @@ class Model(nn.Module):
             stats[name] = {
                 "norm": current.norm().detach(),
                 "delta_norm": delta_norm.detach(),
-                "relative_delta": (
-                    delta_norm / initial_norm.clamp_min(1e-12)
-                ).detach(),
+                "relative_delta": (delta_norm / initial_norm.clamp_min(1e-12)).detach(),
             }
         return stats
 
     def _debug_segment_embedding_stats(self) -> dict[str, Tensor]:
-        buffer_name = self._debug_initial_parameter_buffers[
-            "segment_embedding.weight"
-        ]
+        buffer_name = self._debug_initial_parameter_buffers["segment_embedding.weight"]
         initial = getattr(self, buffer_name).detach().float()
         current = self.segment_embedding.weight.detach().float()
         initial_norms = initial.norm(dim=-1)
@@ -1063,8 +1033,7 @@ class Model(nn.Module):
         cosine_denominator = current_norms * initial_norms
         initial_cosines = torch.where(
             cosine_denominator > 0,
-            (current * initial).sum(dim=-1)
-            / cosine_denominator.clamp_min(1e-12),
+            (current * initial).sum(dim=-1) / cosine_denominator.clamp_min(1e-12),
             torch.zeros_like(cosine_denominator),
         )
         normalized = current / current_norms[:, None].clamp_min(1e-12)
@@ -1076,9 +1045,7 @@ class Model(nn.Module):
         return {
             "norms": current_norms.detach(),
             "delta_norms": delta_norms.detach(),
-            "relative_deltas": (
-                delta_norms / initial_norms.clamp_min(1e-12)
-            ).detach(),
+            "relative_deltas": (delta_norms / initial_norms.clamp_min(1e-12)).detach(),
             "initial_cosines": initial_cosines.detach(),
             "cosine_matrix": cosine_matrix.detach(),
         }
@@ -1119,9 +1086,7 @@ class Model(nn.Module):
                 # Existing segment diagnostics describe the output-aligned
                 # workspace. Scratchpad slots are deliberately not assigned a
                 # grammatical segment, so exclude them from these summaries.
-                state_gradient = state_gradient[
-                    :, 1 : 1 + valid_tokens.shape[1]
-                ]
+                state_gradient = state_gradient[:, 1 : 1 + valid_tokens.shape[1]]
             stages.append(
                 {
                     "step": step,
@@ -1140,8 +1105,7 @@ class Model(nn.Module):
         final_gradient_rms = stages[-1]["state_grad_rms"]
         for stage in stages:
             stage["relative_to_final"] = (
-                stage["state_grad_rms"]
-                / final_gradient_rms.clamp_min(1e-12)
+                stage["state_grad_rms"] / final_gradient_rms.clamp_min(1e-12)
             ).detach()
 
         return {
@@ -1272,20 +1236,12 @@ class Model(nn.Module):
             self._debug_training_context = None
             segment_signal.retain_grad()
         token_state = self.token_embedding(input_ids) + segment_signal
-        collect_act_diagnostics = (
-            self.collect_act_diagnostics if DBUG else False
-        )
-        collect_model_diagnostics = (
-            self.collect_model_diagnostics if DBUG else False
-        )
+        collect_act_diagnostics = self.collect_act_diagnostics if DBUG else False
+        collect_model_diagnostics = self.collect_model_diagnostics if DBUG else False
         layer_diagnostics = [] if collect_model_diagnostics else None
         stage_states = [] if collect_model_diagnostics else None
         training_stage_states = [] if collect_training_diagnostics else None
-        hypothesis_states = (
-            []
-            if USE_LATENT_HYPOTHESES and not self.use_act
-            else None
-        )
+        hypothesis_states = [] if USE_LATENT_HYPOTHESES and not self.use_act else None
         x, ponder_cost, act_diagnostics = self._run_processor(
             token_state,
             position_signal,
@@ -1316,10 +1272,7 @@ class Model(nn.Module):
                 dim=1,
             )
             hypothesis_logits = torch.stack(
-                [
-                    self.head(self.final_norm(state))
-                    for state in hypothesis_states
-                ],
+                [self.head(self.final_norm(state)) for state in hypothesis_states],
                 dim=1,
             )
             hypothesis_log_prior = F.log_softmax(
@@ -1370,13 +1323,27 @@ class Model(nn.Module):
         return logits, auxiliary
 
 
+# build_model runs at the start of each seed, so this tracks the evaluator's
+# own training deadline closely enough to anneal against.
+_SEED_STARTED_AT: float | None = None
+
+
+def _construction_device() -> torch.device:
+    # Construction is charged to the training budget. CPU init plus the copy
+    # costs ~4.8s of the 60s Easy budget at this width.
+    if BUILD_ON_ACCELERATOR and torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
 def build_model(spec: ModelSpec) -> Model:
-    model = Model(spec, use_act=USE_ACT)
+    global _SEED_STARTED_AT
+    _SEED_STARTED_AT = time.monotonic()
+    with torch.device(_construction_device()):
+        model = Model(spec, use_act=USE_ACT)
     assert_model_state(model, spec)
     if DBUG:
-        total_parameters = sum(
-            parameter.numel() for parameter in model.parameters()
-        )
+        total_parameters = sum(parameter.numel() for parameter in model.parameters())
         print(f"TOTAL_PARAMETERS: {total_parameters:,}")
         print(
             "Constants\n"
@@ -1388,8 +1355,7 @@ def build_model(spec: ModelSpec) -> Model:
             f"MUON_MOMENTUM: {MUON_MOMENTUM}, "
             f"MUON_WEIGHT_DECAY: {MUON_WEIGHT_DECAY}, "
             f"MUON_ADJUST_LR_FN: {MUON_ADJUST_LR_FN}, "
-            f"LR_DECAY_START_STEP: {LR_DECAY_START_STEP}, "
-            f"LR_DECAY_END_STEP: {LR_DECAY_END_STEP}, "
+            f"LR_DECAY_HOLD_FRACTION: {LR_DECAY_HOLD_FRACTION}, "
             f"LR_DECAY_MIN_FACTOR: {LR_DECAY_MIN_FACTOR}, "
             f"USE_LATENT_HYPOTHESES: {USE_LATENT_HYPOTHESES}, "
             f"HYPOTHESIS_TEMPERATURE: {HYPOTHESIS_TEMPERATURE}, "
@@ -1397,6 +1363,8 @@ def build_model(spec: ModelSpec) -> Model:
             f"{HYPOTHESIS_ALL_LOSS_WEIGHT}, "
             f"HYPOTHESIS_DEPTH_PENALTY: {HYPOTHESIS_DEPTH_PENALTY}, "
             f"NUM_SCRATCHPAD_TOKENS: {NUM_SCRATCHPAD_TOKENS}, "
+            f"BUILD_ON_ACCELERATOR: {BUILD_ON_ACCELERATOR}, "
+            f"construction_device: {_construction_device()}, "
             f"DBUG: {DBUG}"
         )
     return model
@@ -1409,9 +1377,7 @@ class CombinedOptimizer:
     @property
     def param_groups(self) -> list[dict]:
         return [
-            group
-            for optimizer in self.optimizers
-            for group in optimizer.param_groups
+            group for optimizer in self.optimizers for group in optimizer.param_groups
         ]
 
     def zero_grad(self, set_to_none: bool = True) -> None:
@@ -1431,56 +1397,68 @@ class CombinedOptimizer:
         return result
 
     def state_dict(self) -> dict:
-        return {
-            "optimizers": [
-                optimizer.state_dict() for optimizer in self.optimizers
-            ]
-        }
+        return {"optimizers": [optimizer.state_dict() for optimizer in self.optimizers]}
 
 
 class CosineDecayScheduler:
+    """Anneal every parameter group across the evaluator's wall-clock budget."""
+
     def __init__(
         self,
         optimizer,
         *,
-        start_step: int,
-        end_step: int,
+        total_seconds: float,
+        hold_fraction: float,
         min_factor: float,
+        started_at: float | None = None,
+        clock=time.monotonic,
     ) -> None:
-        if start_step < 0:
-            raise ValueError("decay start step must be non-negative")
-        if end_step <= start_step:
-            raise ValueError("decay end step must be after the start step")
+        if total_seconds <= 0.0:
+            raise ValueError("training budget must be positive")
+        if not 0.0 <= hold_fraction < 1.0:
+            raise ValueError("hold fraction must be in [0, 1)")
         if not 0.0 <= min_factor <= 1.0:
             raise ValueError("minimum learning-rate factor must be in [0, 1]")
 
         self.optimizer = optimizer
-        self.start_step = start_step
-        self.end_step = end_step
-        self.min_factor = min_factor
+        self.total_seconds = float(total_seconds)
+        self.hold_fraction = float(hold_fraction)
+        self.min_factor = float(min_factor)
+        self.clock = clock
+        self.started_at = clock() if started_at is None else float(started_at)
         self.completed_steps = 0
         self.base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
 
+    def factor(self) -> float:
+        elapsed_fraction = (self.clock() - self.started_at) / self.total_seconds
+        elapsed_fraction = min(max(elapsed_fraction, 0.0), 1.0)
+        if elapsed_fraction <= self.hold_fraction:
+            return 1.0
+        decay_progress = (elapsed_fraction - self.hold_fraction) / (
+            1.0 - self.hold_fraction
+        )
+        cosine = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+        return self.min_factor + (1.0 - self.min_factor) * cosine
+
     def step(self) -> None:
         self.completed_steps += 1
-        if self.completed_steps <= self.start_step:
-            factor = 1.0
-        elif self.completed_steps >= self.end_step:
-            factor = self.min_factor
-        else:
-            progress = (
-                (self.completed_steps - self.start_step)
-                / (self.end_step - self.start_step)
-            )
-            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-            factor = self.min_factor + (1.0 - self.min_factor) * cosine
-
+        factor = self.factor()
         for group, base_lr in zip(
             self.optimizer.param_groups,
             self.base_lrs,
             strict=True,
         ):
             group["lr"] = base_lr * factor
+
+
+def _build_scheduler(optimizer, spec: OptimizerSpec) -> CosineDecayScheduler:
+    return CosineDecayScheduler(
+        optimizer,
+        total_seconds=spec.training_time_seconds,
+        hold_fraction=LR_DECAY_HOLD_FRACTION,
+        min_factor=LR_DECAY_MIN_FACTOR,
+        started_at=_SEED_STARTED_AT,
+    )
 
 
 def build_optimizer(model: nn.Module, spec: OptimizerSpec) -> OptimizerBundle:
@@ -1513,13 +1491,10 @@ def build_optimizer(model: nn.Module, spec: OptimizerSpec) -> OptimizerBundle:
             capturable=spec.device_type == "cuda",
         )
         optimizer = CombinedOptimizer([muon, adamw])
-        scheduler = CosineDecayScheduler(
+        return OptimizerBundle(
             optimizer,
-            start_step=LR_DECAY_START_STEP,
-            end_step=LR_DECAY_END_STEP,
-            min_factor=LR_DECAY_MIN_FACTOR,
+            scheduler=_build_scheduler(optimizer, spec),
         )
-        return OptimizerBundle(optimizer, scheduler=scheduler)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -1528,13 +1503,7 @@ def build_optimizer(model: nn.Module, spec: OptimizerSpec) -> OptimizerBundle:
         weight_decay=0.1,
         capturable=spec.device_type == "cuda",
     )
-    scheduler = CosineDecayScheduler(
-        optimizer,
-        start_step=LR_DECAY_START_STEP,
-        end_step=LR_DECAY_END_STEP,
-        min_factor=LR_DECAY_MIN_FACTOR,
-    )
-    return OptimizerBundle(optimizer, scheduler=scheduler)
+    return OptimizerBundle(optimizer, scheduler=_build_scheduler(optimizer, spec))
 
 
 SUBMISSION = Submission(
