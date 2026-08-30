@@ -66,13 +66,15 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
         self.assertFalse(hasattr(fixed_model, "collect_model_diagnostics"))
         self.assertFalse(hasattr(fixed_model, "collect_training_diagnostics"))
         self.assertIsInstance(training_auxiliary, dict)
+        train_loops = self.namespace["TRAIN_LOOPS"]
         self.assertEqual(
             training_auxiliary["hypothesis_logits"].shape,
-            (1, fixed_model.max_loops, 4, 17),
+            (1, train_loops, 4, 17),
         )
+        # One prior row per example now, not one shared vector.
         self.assertEqual(
             training_auxiliary["hypothesis_log_prior"].shape,
-            (fixed_model.max_loops,),
+            (1, train_loops),
         )
 
         fixed_model.eval()
@@ -223,7 +225,9 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
         loss.backward()
         diagnostics = model.consume_training_grad_diagnostics()
 
-        self.assertEqual(len(diagnostics["stages"]), model.max_loops + 1)
+        self.assertEqual(
+            len(diagnostics["stages"]), self.namespace["TRAIN_LOOPS"] + 1
+        )
         self.assertEqual(
             diagnostics["segment_signal_grad_rms_by_segment"].shape,
             (self.namespace["NUM_SEGMENTS"],),
@@ -387,24 +391,34 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
         self.assertEqual(result[0, 1, 0].item(), 7.0)
         self.assertEqual(result[0, 2, 0].item(), 7.0)
 
-    def test_default_model_uses_two_synchronized_loops(self) -> None:
+    def test_train_and_eval_run_different_synchronized_depths(self) -> None:
         self.namespace["DBUG"] = False
+        train_loops = self.namespace["TRAIN_LOOPS"]
+        eval_loops = self.namespace["EVAL_LOOPS"]
         model = self.model_class(self.spec)
 
         self.assertFalse(model.use_act)
-        self.assertEqual(model.max_loops, 2)
+        self.assertEqual(model.max_loops, eval_loops)
         self.assertIsInstance(
             model.processor,
             self.namespace["SynchronizedProcessor"],
         )
+
+        model.train()
+        self.assertEqual(model.active_loops(), train_loops)
         logits, auxiliary = model(self.input_ids, self.attention_mask)
         self.assertEqual(logits.shape, (1, 4, 17))
         self.assertIsInstance(auxiliary, dict)
         self.assertEqual(auxiliary["ponder_cost"].item(), 0.0)
         self.assertEqual(
             auxiliary["hypothesis_logits"].shape,
-            (1, model.max_loops, 4, 17),
+            (1, train_loops, 4, 17),
         )
+
+        model.eval()
+        self.assertEqual(model.active_loops(), eval_loops)
+        eval_logits, _ = model(self.input_ids, self.attention_mask)
+        self.assertEqual(eval_logits.shape, (1, 4, 17))
 
     def test_act_and_fixed_modes_share_common_initialization(self) -> None:
         self.namespace["DBUG"] = False
@@ -460,7 +474,7 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
                 if hypothesis_states is not None:
                     output_end = 1 + prompt_memory.shape[1]
                     hypothesis_states.extend(
-                        [work_state[:, 1:output_end]] * model.max_loops
+                        [work_state[:, 1:output_end]] * model.active_loops()
                     )
                 return work_state
 
@@ -773,7 +787,9 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
                 model = self.model_class(ModelSpec(17, max_seq_len, ceiling))
             elements = count_model_state_elements(model)
             self.assertLessEqual(elements, ceiling)
-            self.assertGreater(elements, 450_000_000)
+            # Width is traded against loop count, so the floor only guards
+            # against an accidental collapse to a toy model.
+            self.assertGreater(elements, 1_000_000)
 
     def test_latent_hypothesis_loss_uses_only_valid_target_positions(self) -> None:
         candidate_logits = torch.zeros(1, 2, 4, 3)
@@ -812,57 +828,97 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
         self.assertGreater(hypothesis_prior.grad.abs().sum(), 0)
         self.assertIsNone(batch.logits.grad)
 
-    def test_eval_uses_the_globally_selected_hypothesis(self) -> None:
-        self.namespace["DBUG"] = False
+    def test_eval_selects_an_exit_per_row_from_the_t_segment(self) -> None:
+        self.namespace["DBUG"] = True
         model = self.model_class(self.spec, use_act=False)
         with torch.no_grad():
-            model.hypothesis_prior.copy_(torch.tensor([10.0, -10.0]))
-
-        model.train()
-        _, training_auxiliary = model(
-            self.input_ids,
-            self.attention_mask,
-        )
-        expected_logits = training_auxiliary["hypothesis_logits"][:, 0]
-
+            torch.nn.init.normal_(model.exit_head.weight, std=1.0)
+            torch.nn.init.normal_(model.exit_head.bias, std=1.0)
         model.eval()
-        evaluation_logits, evaluation_auxiliary = model(
-            self.input_ids,
-            self.attention_mask,
-        )
 
-        torch.testing.assert_close(evaluation_logits, expected_logits)
-        self.assertTrue(torch.is_tensor(evaluation_auxiliary))
-        self.assertEqual(evaluation_auxiliary.ndim, 0)
+        # Two prompts identical except for the digit in the T segment.
+        input_ids = torch.tensor([[2, 10, 4, 8], [2, 10, 4, 9]])
+        mask = torch.ones_like(input_ids, dtype=torch.bool)
+        logits, auxiliary = model(input_ids, mask)
 
-    def test_hypothesis_depth_penalty_prefers_the_earlier_exit(self) -> None:
-        candidate_logits = torch.zeros(
-            1,
-            2,
-            2,
-            3,
-            requires_grad=True,
-        )
+        prior = auxiliary["hypothesis_log_prior"]
+        self.assertEqual(prior.shape, (2, self.namespace["EVAL_LOOPS"]))
+        self.assertFalse(torch.allclose(prior[0], prior[1]))
+
+        chosen = prior.argmax(dim=-1)
+        for row in range(2):
+            torch.testing.assert_close(
+                logits[row],
+                auxiliary["hypothesis_logits"][row, chosen[row]],
+            )
+
+    def test_row_label_routes_gradient_to_the_matching_exit(self) -> None:
+        # Exit 0 predicts token 2, exit 1 predicts token 0, and the label is 0.
+        candidate_logits = torch.zeros(1, 2, 1, 3)
+        candidate_logits[0, 0, 0, 2] = 8.0
+        candidate_logits[0, 1, 0, 0] = 8.0
+        candidate_logits.requires_grad_()
         hypothesis_prior = torch.zeros(2, requires_grad=True)
         batch = TokenLossBatch(
             logits=torch.zeros(1, 1, 3),
             labels=torch.tensor([[0]]),
             valid_mask=torch.tensor([[True]]),
-            target_positions=torch.tensor([[1]]),
+            target_positions=torch.tensor([[0]]),
             auxiliary={
                 "ponder_cost": torch.zeros(()),
                 "hypothesis_logits": candidate_logits,
-                "hypothesis_log_prior": torch.log_softmax(
-                    hypothesis_prior,
-                    dim=0,
-                ),
+                "hypothesis_log_prior": torch.log_softmax(hypothesis_prior, dim=0),
             },
         )
 
-        self.namespace["token_training_loss"](batch).backward()
+        loss = self.namespace["token_training_loss"](batch)
+        loss.backward()
 
-        self.assertLess(hypothesis_prior.grad[0].item(), 0.0)
-        self.assertGreater(hypothesis_prior.grad[1].item(), 0.0)
+        self.assertTrue(torch.isfinite(loss))
+        matching = candidate_logits.grad[0, 1].abs().sum()
+        mismatched = candidate_logits.grad[0, 0].abs().sum()
+        self.assertGreater(matching, mismatched)
+        self.assertLess(hypothesis_prior.grad[1].item(), hypothesis_prior.grad[0].item())
+
+    def test_row_loss_is_a_soft_min_bounded_by_the_exit_losses(self) -> None:
+        # Equal exits must reduce to plain cross entropy, and unequal exits
+        # must land between the best exit and their mean.
+        def row_loss(second_exit_logit: float) -> float:
+            candidate_logits = torch.zeros(1, 2, 1, 3)
+            candidate_logits[0, 0, 0, 0] = 4.0
+            candidate_logits[0, 1, 0, 0] = second_exit_logit
+            batch = TokenLossBatch(
+                logits=torch.zeros(1, 1, 3),
+                labels=torch.tensor([[0]]),
+                valid_mask=torch.tensor([[True]]),
+                target_positions=torch.tensor([[0]]),
+                auxiliary={
+                    "ponder_cost": torch.zeros(()),
+                    "hypothesis_logits": candidate_logits,
+                    "hypothesis_log_prior": torch.log_softmax(
+                        torch.zeros(2), dim=0
+                    ),
+                },
+            )
+            return float(self.namespace["token_training_loss"](batch))
+
+        identical = row_loss(4.0)
+        plain = float(
+            torch.nn.functional.cross_entropy(
+                torch.tensor([[4.0, 0.0, 0.0]]), torch.tensor([0])
+            )
+        )
+        self.assertAlmostEqual(identical, plain, places=5)
+
+        best = plain
+        worst = float(
+            torch.nn.functional.cross_entropy(
+                torch.tensor([[0.0, 0.0, 0.0]]), torch.tensor([0])
+            )
+        )
+        mixed = row_loss(0.0)
+        self.assertGreater(mixed, best)
+        self.assertLess(mixed, 0.5 * (best + worst))
 
 
 if __name__ == "__main__":

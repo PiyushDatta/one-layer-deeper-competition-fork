@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import math
 import time
 
@@ -15,13 +16,18 @@ from benchmark import (
 )
 from torch import nn, Tensor
 
-# State is 12 * D_MODEL**2 + ~53 * D_MODEL: 491,859,202 of the 500M ceiling.
-D_MODEL = 6400
-NUM_HEADS = 50  # head_dim 128
+# State is 12 * D_MODEL**2 + ~118 * D_MODEL: 12,703,873 of the 500M ceiling.
+# Width is traded for loops on purpose, since cost per loop scales as D_MODEL**2
+# while depth is what the T ladder rewards.
+D_MODEL = 1024
+NUM_HEADS = 8  # head_dim 128
 D_FF = 4 * D_MODEL
 PONDER_WEIGHT = 0.005
 USE_ACT = False
-FIXED_LOOPS = 7
+# Training depth is bounded by the clock, evaluation depth is nearly free
+# because it is forward-only over a few hundred rows.
+TRAIN_LOOPS = 8
+EVAL_LOOPS = 64
 ACT_MAX_LOOPS = 16
 ACT_TAIL_HALT_FRACTION = None
 USE_MUON = True
@@ -30,15 +36,22 @@ MUON_MOMENTUM = 0.95
 MUON_WEIGHT_DECAY = 0.1
 MUON_ADJUST_LR_FN = "match_rms_adamw"
 # Fraction of the wall-clock budget, not a step count, so one value works at
-# every tier. Constant then a ~15% decay is the warmup-stable-decay shape.e
+# every tier. Constant then a ~15% decay is the warmup-stable-decay shape.
 LR_DECAY_HOLD_FRACTION = 0.85
 LR_DECAY_MIN_FACTOR = 0.001
 USE_LATENT_HYPOTHESES = True
 HYPOTHESIS_TEMPERATURE = 1.0
-HYPOTHESIS_ALL_LOSS_WEIGHT = 0.25
-HYPOTHESIS_DEPTH_PENALTY = 0.01
 NUM_SCRATCHPAD_TOKENS = 4
+# The tied head makes logit scale grow as sqrt(D_MODEL), which peaks the
+# softmax and lets retokenization compound into a feedback loop across loops.
+# Divide that back out. Only the D_MODEL=4096 value of 8.0 is measured, the
+# scaling to other widths is inferred.
+RETOKENIZE_TEMPERATURE = D_MODEL**0.5 / 8.0
+# sigmoid(-2.0) is about 0.12, so the bottleneck starts nearly closed and the
+# model opens it only if it pays for itself.
+RETOKENIZE_GATE_INIT = -2.0
 BUILD_ON_ACCELERATOR = True
+PRINT_LOGS = False
 DBUG = False
 
 PAD_TOKEN_ID = 0
@@ -116,23 +129,19 @@ def token_training_loss(batch: TokenLossBatch) -> Tensor:
     target_counts = candidate_valid_mask.sum(dim=-1).clamp_min(1)
     sequence_losses = (token_losses * candidate_valid_mask).sum(dim=-1) / target_counts
     rows_with_targets = batch.valid_mask.any(dim=-1)
-    candidate_evidence = sequence_losses[rows_with_targets].mean(dim=0)
-    depth_cost = HYPOTHESIS_DEPTH_PENALTY * torch.arange(
-        candidate_count,
-        device=candidate_evidence.device,
-        dtype=candidate_evidence.dtype,
-    )
-    selection_evidence = candidate_evidence + depth_cost
 
+    # Per-row soft-min over exits. A row's own label picks its depth: for a T=k
+    # prompt only the exit whose readout equals x^(2^k) has low loss, so the
+    # tied block is trained as one composable step rather than a T-specific
+    # map. Averaging rows first would force a single exit on the whole batch,
+    # and scoring every exit against the final label would demand B(B(x)) ==
+    # B(x), which is the one operator shape that cannot extrapolate in T.
     temperature = HYPOTHESIS_TEMPERATURE
-    survivor_loss = -temperature * torch.logsumexp(
-        hypothesis_log_prior - selection_evidence / temperature,
-        dim=0,
+    row_losses = -temperature * torch.logsumexp(
+        hypothesis_log_prior - sequence_losses / temperature,
+        dim=1,
     )
-    all_candidate_loss = candidate_evidence.mean()
-    task_loss = (
-        1.0 - HYPOTHESIS_ALL_LOSS_WEIGHT
-    ) * survivor_loss + HYPOTHESIS_ALL_LOSS_WEIGHT * all_candidate_loss
+    task_loss = row_losses[rows_with_targets].mean()
     return task_loss + PONDER_WEIGHT * ponder_cost
 
 
@@ -435,6 +444,8 @@ class SynchronizedProcessor(nn.Module):
         work_state: Tensor,
         attention_mask: Tensor | None = None,
         *,
+        num_loops: int | None = None,
+        retokenize: Callable[[Tensor], Tensor] | None = None,
         segment_ids: Tensor | None = None,
         layer_diagnostics: list[dict[str, object]] | None = None,
         stage_states: list[Tensor] | None = None,
@@ -531,7 +542,8 @@ class SynchronizedProcessor(nn.Module):
             work_state.retain_grad()
             training_stage_states.append(work_state)
 
-        for _ in range(self.num_loops):
+        loops = self.num_loops if num_loops is None else num_loops
+        for _ in range(loops):
             joint_state = torch.cat((prompt_memory, work_state), dim=1)
             if layer_diagnostics is None:
                 candidate_state = self.block(joint_state, joint_mask)
@@ -549,6 +561,20 @@ class SynchronizedProcessor(nn.Module):
                     key_stream_ids=joint_stream_ids,
                 )
             work_state = candidate_state[:, prompt_len:]
+            if retokenize is not None:
+                # Pull each loop's output back onto the token manifold before
+                # the next application so long iteration cannot drift into
+                # directions the 17-token vocabulary cannot express. Only the
+                # prompt-aligned workspace is constrained, the control token
+                # and scratchpad stay continuous working memory.
+                work_state = torch.cat(
+                    (
+                        work_state[:, :1],
+                        retokenize(work_state[:, 1:output_end]),
+                        work_state[:, output_end:],
+                    ),
+                    dim=1,
+                )
             if stage_states is not None:
                 stage_states.append(work_state[:, 1:output_end].detach())
             if training_stage_states is not None:
@@ -845,7 +871,8 @@ class Model(nn.Module):
         super().__init__()
         self.config = Config(spec.vocab_size, spec.max_seq_len)
         self.use_act = use_act
-        self.max_loops = ACT_MAX_LOOPS if self.use_act else FIXED_LOOPS
+        # Sized for the deepest exit the selector must be able to address.
+        self.max_loops = ACT_MAX_LOOPS if self.use_act else EVAL_LOOPS
         if DBUG:
             self.collect_act_diagnostics = False
             self.collect_model_diagnostics = False
@@ -892,7 +919,7 @@ class Model(nn.Module):
             nn.init.normal_(self.workspace_token, std=init_std)
             self.processor = SynchronizedProcessor(
                 block,
-                num_loops=self.max_loops,
+                num_loops=TRAIN_LOOPS,
                 num_scratchpad_tokens=NUM_SCRATCHPAD_TOKENS,
             )
             if USE_LATENT_HYPOTHESES:
@@ -905,6 +932,17 @@ class Model(nn.Module):
                 D_MODEL,
             )
             nn.init.normal_(self.scratchpad_embedding.weight, std=init_std)
+            # Same reason, these go last. Zero init makes the selector exactly
+            # the old global prior at step 0, so the change cannot regress the
+            # starting point.
+            if USE_LATENT_HYPOTHESES:
+                self.exit_norm = RMSNorm(D_MODEL)
+                self.exit_head = nn.Linear(D_MODEL, self.max_loops)
+                nn.init.zeros_(self.exit_head.weight)
+                nn.init.zeros_(self.exit_head.bias)
+                self.retokenize_gate = nn.Parameter(
+                    torch.full((), RETOKENIZE_GATE_INIT)
+                )
 
         if DBUG:
             self._debug_initial_parameter_buffers = {}
@@ -917,6 +955,28 @@ class Model(nn.Module):
                         persistent=False,
                     )
                     self._debug_initial_parameter_buffers[name] = buffer_name
+
+    def active_loops(self) -> int:
+        if self.use_act:
+            return self.max_loops
+        return TRAIN_LOOPS if self.training else EVAL_LOOPS
+
+    def _retokenize(self, workspace: Tensor) -> Tensor:
+        normed = self.final_norm(workspace)
+        probabilities = F.softmax(
+            self.head(normed) / RETOKENIZE_TEMPERATURE,
+            dim=-1,
+        )
+        # head.weight is token_embedding.weight, so this decodes and re-encodes
+        # through the same tied matrix.
+        token_view = probabilities @ self.token_embedding.weight
+        # Embeddings are std 0.02 and the residual stream is not, so match RMS
+        # to make this a direction blend rather than an amplitude collapse.
+        target_rms = workspace.pow(2).mean(-1, keepdim=True).sqrt()
+        token_rms = token_view.pow(2).mean(-1, keepdim=True).sqrt().clamp_min(1e-6)
+        token_view = token_view * (target_rms / token_rms)
+        gate = torch.sigmoid(self.retokenize_gate)
+        return workspace + gate * (token_view - workspace)
 
     def _run_processor(
         self,
@@ -968,6 +1028,12 @@ class Model(nn.Module):
             (control_state, workspace_state, scratchpad_state),
             dim=1,
         )
+        loop_kwargs = {
+            "num_loops": self.active_loops(),
+            "retokenize": (
+                self._retokenize if USE_LATENT_HYPOTHESES else None
+            ),
+        }
         if (
             layer_diagnostics is None
             and training_stage_states is None
@@ -977,6 +1043,7 @@ class Model(nn.Module):
                 prompt_memory,
                 work_state,
                 attention_mask,
+                **loop_kwargs,
             )
         else:
             work_state = self.processor(
@@ -988,6 +1055,7 @@ class Model(nn.Module):
                 stage_states=stage_states,
                 training_stage_states=training_stage_states,
                 hypothesis_states=hypothesis_states,
+                **loop_kwargs,
             )
         x = work_state[:, 1 : 1 + token_state.shape[1]]
         return x, x.new_zeros(()), None
@@ -1265,23 +1333,41 @@ class Model(nn.Module):
         hypothesis_logits = None
         hypothesis_log_prior = None
         if hypothesis_states is not None:
-            if len(hypothesis_states) != self.max_loops:
+            active_loops = self.active_loops()
+            if len(hypothesis_states) != active_loops:
                 raise RuntimeError("processor did not produce every hypothesis")
-            stacked_hypothesis_states = torch.stack(
-                hypothesis_states,
-                dim=1,
-            )
             hypothesis_logits = torch.stack(
                 [self.head(self.final_norm(state)) for state in hypothesis_states],
                 dim=1,
             )
-            hypothesis_log_prior = F.log_softmax(
-                self.hypothesis_prior,
-                dim=0,
+            # Exit depth has to vary with the prompt's T. Pool the T segment
+            # only, where position_signal keeps multi-digit T ordered.
+            prompt_features = token_state + position_signal
+            t_weights = (segment_ids.eq(3) & valid_tokens).to(prompt_features.dtype)
+            t_summary = (prompt_features * t_weights[..., None]).sum(dim=1) / (
+                t_weights.sum(dim=1, keepdim=True).clamp_min(1.0)
             )
-            winning_hypothesis = self.hypothesis_prior.argmax(dim=0)
-            x = stacked_hypothesis_states[:, winning_hypothesis]
-            logits = hypothesis_logits[:, winning_hypothesis]
+            hypothesis_log_prior = F.log_softmax(
+                (self.exit_head(self.exit_norm(t_summary)) + self.hypothesis_prior)[
+                    :, :active_loops
+                ],
+                dim=-1,
+            )
+            selected = hypothesis_log_prior.argmax(dim=-1)
+            gather_index = selected[:, None, None, None]
+            logits = hypothesis_logits.gather(
+                1,
+                gather_index.expand(-1, 1, *hypothesis_logits.shape[2:]),
+            ).squeeze(1)
+            if DBUG and collect_model_diagnostics:
+                # x only feeds the diagnostic pass, so skip stacking every
+                # retained state when it is not going to be read.
+                x = torch.stack(hypothesis_states, dim=1).gather(
+                    1,
+                    selected[:, None, None, None].expand(
+                        -1, 1, *hypothesis_states[0].shape[1:]
+                    ),
+                ).squeeze(1)
         else:
             logits = self.head(self.final_norm(x))
 
@@ -1341,32 +1427,46 @@ def build_model(spec: ModelSpec) -> Model:
     _SEED_STARTED_AT = time.monotonic()
     with torch.device(_construction_device()):
         model = Model(spec, use_act=USE_ACT)
-    assert_model_state(model, spec)
-    if DBUG:
-        total_parameters = sum(parameter.numel() for parameter in model.parameters())
-        print(f"TOTAL_PARAMETERS: {total_parameters:,}")
-        print(
-            "Constants\n"
-            f" D_MODEL: {D_MODEL}, NUM_HEADS: {NUM_HEADS}, D_FF: {D_FF}, "
-            f"PONDER_WEIGHT: {PONDER_WEIGHT}, USE_ACT: {USE_ACT}, "
-            f"FIXED_LOOPS: {FIXED_LOOPS}, ACT_MAX_LOOPS: {ACT_MAX_LOOPS}, "
-            f"ACT_TAIL_HALT_FRACTION: {ACT_TAIL_HALT_FRACTION}, "
-            f"USE_MUON: {USE_MUON}, MUON_LR: {MUON_LR}, "
-            f"MUON_MOMENTUM: {MUON_MOMENTUM}, "
-            f"MUON_WEIGHT_DECAY: {MUON_WEIGHT_DECAY}, "
-            f"MUON_ADJUST_LR_FN: {MUON_ADJUST_LR_FN}, "
-            f"LR_DECAY_HOLD_FRACTION: {LR_DECAY_HOLD_FRACTION}, "
-            f"LR_DECAY_MIN_FACTOR: {LR_DECAY_MIN_FACTOR}, "
-            f"USE_LATENT_HYPOTHESES: {USE_LATENT_HYPOTHESES}, "
-            f"HYPOTHESIS_TEMPERATURE: {HYPOTHESIS_TEMPERATURE}, "
-            f"HYPOTHESIS_ALL_LOSS_WEIGHT: "
-            f"{HYPOTHESIS_ALL_LOSS_WEIGHT}, "
-            f"HYPOTHESIS_DEPTH_PENALTY: {HYPOTHESIS_DEPTH_PENALTY}, "
-            f"NUM_SCRATCHPAD_TOKENS: {NUM_SCRATCHPAD_TOKENS}, "
-            f"BUILD_ON_ACCELERATOR: {BUILD_ON_ACCELERATOR}, "
-            f"construction_device: {_construction_device()}, "
-            f"DBUG: {DBUG}"
-        )
+    state_elements = assert_model_state(model, spec)
+    if not PRINT_LOGS:
+        return model
+
+    trainable = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    ceiling = spec.maximum_model_state_elements
+    print(
+        f"MODEL | state {state_elements:,} of {ceiling:,} "
+        f"({100.0 * state_elements / ceiling:.2f}%), "
+        f"headroom {ceiling - state_elements:,} | trainable {trainable:,} | "
+        f"vocab {spec.vocab_size} max_seq_len {spec.max_seq_len} | "
+        f"built on {_construction_device()}",
+        flush=True,
+    )
+    print(
+        "CONSTANTS |"
+        f" D_MODEL: {D_MODEL}, NUM_HEADS: {NUM_HEADS}, D_FF: {D_FF}, "
+        f"PONDER_WEIGHT: {PONDER_WEIGHT}, USE_ACT: {USE_ACT}, "
+        f"TRAIN_LOOPS: {TRAIN_LOOPS}, EVAL_LOOPS: {EVAL_LOOPS}, "
+        f"ACT_MAX_LOOPS: {ACT_MAX_LOOPS}, "
+        f"ACT_TAIL_HALT_FRACTION: {ACT_TAIL_HALT_FRACTION}, "
+        f"USE_MUON: {USE_MUON}, MUON_LR: {MUON_LR}, "
+        f"MUON_MOMENTUM: {MUON_MOMENTUM}, "
+        f"MUON_WEIGHT_DECAY: {MUON_WEIGHT_DECAY}, "
+        f"MUON_ADJUST_LR_FN: {MUON_ADJUST_LR_FN}, "
+        f"LR_DECAY_HOLD_FRACTION: {LR_DECAY_HOLD_FRACTION}, "
+        f"LR_DECAY_MIN_FACTOR: {LR_DECAY_MIN_FACTOR}, "
+        f"USE_LATENT_HYPOTHESES: {USE_LATENT_HYPOTHESES}, "
+        f"HYPOTHESIS_TEMPERATURE: {HYPOTHESIS_TEMPERATURE}, "
+        f"NUM_SCRATCHPAD_TOKENS: {NUM_SCRATCHPAD_TOKENS}, "
+        f"RETOKENIZE_TEMPERATURE: {RETOKENIZE_TEMPERATURE}, "
+        f"RETOKENIZE_GATE_INIT: {RETOKENIZE_GATE_INIT}, "
+        f"BUILD_ON_ACCELERATOR: {BUILD_ON_ACCELERATOR}, "
+        f"PRINT_LOGS: {PRINT_LOGS}, DBUG: {DBUG}",
+        flush=True,
+    )
     return model
 
 
