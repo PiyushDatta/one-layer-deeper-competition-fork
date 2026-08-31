@@ -125,3 +125,50 @@ large enough that the same configuration measured 0.0833 and 0.0333 in two
 sweeps an hour apart. Use `tmp/allten.py` for any future selection.
 
 **The shipped configuration stands.** Nothing found in this session beats it.
+
+## 7. The failure is architecture-limited, not data-limited
+
+Two probes in `tmp/data_limit.py`, both outside the submission.
+
+**Coverage does not help.** Vary how many of the 288 units are shown, hold out
+the rest, ~22,000 full-batch steps each:
+
+| shown | train n | held n | train exact | held exact |
+|---:|---:|---:|---:|---:|
+| 50% | 144 | 144 | 1.000 | 0.007 |
+| 70% | 201 | 87 | 1.000 | 0.000 |
+| 86% | 247 | 41 | 1.000 | 0.024 |
+| 93% | 267 | 21 | 1.000 | 0.000 |
+| 97% | 279 | 9 | 1.000 | 0.000 |
+
+Showing 279 of 288 entries and holding out 9 still generalises to none of them.
+The model is filling a table, not interpolating a function, and E1's 86% is not
+the binding constraint.
+
+**Volume does not help either.** Modular multiplication `x*y mod 323` over all
+288^2 pairs, same digit tokenisation, 74,649 training pairs, 35,874 steps:
+
+```
+train exact 0.844    held exact 0.085
+```
+
+300x the data and generalisation is still 8.5%. A transformer over digit tokens
+does not learn generalising modular arithmetic. That is the wall, and it sits
+below every structural idea in this document.
+
+## 8. The machinery is worth 2.2x, SAM is score-neutral
+
+Ten Easy datasets, `tmp/ablate_all.py`:
+
+| | mean over 10 datasets |
+|---|---:|
+| shipped | **0.0516** |
+| shipped without SAM | 0.0513 |
+| minimal: no hypotheses, no history, no tape, no SAM, T visible | 0.0238 |
+
+Changes 7 to 16 collectively more than double the score against a stripped
+model, so the structural work was not wasted even though it did not reach Max T.
+
+SAM is a wash on score, 0.0513 against 0.0516, despite cutting test loss from
+5.78 to 4.02 in the single-dataset measurement. It buys loss geometry and costs
+half the step count. Keep or drop on other grounds; it does not move the metric.
