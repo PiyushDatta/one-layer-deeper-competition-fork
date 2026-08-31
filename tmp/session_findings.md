@@ -96,3 +96,32 @@ all downstream of a step map the model cannot learn.
 Reaching Max T needs `x^2 mod N` to generalise to unseen units from a few
 hundred digit-tokenised examples in 60 seconds. That is the open problem, and
 none of the structural work touches it.
+
+## 6. No tuned configuration beats the shipped one
+
+A random search over width, loops, both weight decays, learning rate, SAM and
+T-visibility, scored on three Easy datasets, produced three candidates that
+looked better than shipped on that mean. The best was `D_MODEL=64`,
+`TRAIN_LOOPS=8`, Muon decay 1.0, AdamW decay 3.0.
+
+Re-scored on all ten Easy datasets it loses clearly:
+
+| dataset | shipped | candidate |
+|---|---:|---:|
+| e1 | 0.0517 | 0.0483 |
+| e2 | 0.0171 | 0.0090 |
+| e3 | 0.0044 | 0.0163 |
+| e4 | 0.0091 | 0.0030 |
+| e5 | 0.0046 | 0.0046 |
+| e6 | 0.0820 | 0.0588 |
+| e7 | 0.0597 | 0.0677 |
+| e8 | 0.1009 | 0.0656 |
+| e9 | 0.0378 | 0.0322 |
+| e10 | 0.1021 | 0.0211 |
+| **mean** | **0.0469** | **0.0326** |
+
+Three datasets is not enough to select on. Single-run noise on one dataset is
+large enough that the same configuration measured 0.0833 and 0.0333 in two
+sweeps an hour apart. Use `tmp/allten.py` for any future selection.
+
+**The shipped configuration stands.** Nothing found in this session beats it.
