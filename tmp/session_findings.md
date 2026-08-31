@@ -228,3 +228,44 @@ M1, fixed N=10403, 600s: **train exact 0.000 at 1,900 steps**, loss plateaued at
 4.37. The extra compute and 45x the data do not help because five-digit N is a
 much harder step map. The grokking-regime argument for Medium does not survive
 contact with M1.
+
+## 13. E1's scored metric cannot move, and here is the proof
+
+The recurring 5/150 across nine configurations is not collapse onto a constant,
+the model emits 59 distinct answers over 150 test rows. It is something more
+specific.
+
+```
+shipped   seed 74    correct rows: [2, 78, 102, 140, 141]
+d128 L2   seed 74    correct rows: [2, 23, 59, 78, 140]
+shipped   seed 1234  correct rows: [2, 78, 102, 140, 141]
+
+answer-length of every row ever solved:  1-digit 6, 2-digit 1
+answer-length of the 150 test rows:      3-digit 114, 2-digit 23, 1-digit 13
+```
+
+**No configuration has ever solved a single 3-digit answer**, and 114 of the 150
+test rows have one. Identical seeds give identical correct sets. The model
+varies its wrong answers on long rows while only landing short ones, where
+guessing the modal digit works.
+
+E1's exact accuracy is therefore measuring "how many of the 13 one-digit
+answers did you guess", and 0.0517 was never a score to move. Stop tuning
+against it. Use test CE, or the reserved-set numbers, or a Medium or Hard run.
+
+## 14. Hard pre-flight: EVAL_LOOPS=128 is safe
+
+`evaluation_seconds` as a fraction of the evaluation budget:
+
+| tier | eval seconds | budget | fraction |
+|---|---:|---:|---:|
+| Easy E1 | 9.25 | 30 | 30.8% |
+| Medium M1 | 18.79 | 300 | **6.3%** |
+
+The eval set does not grow with the budget, so the fraction falls sharply at
+higher tiers. Hard has 1,800s, leaving roughly 15x headroom even if its private
+eval set is much larger than Medium's. No need to reduce EVAL_LOOPS before a
+Hard attempt.
+
+M1 also scored 0.00033 with 4,561 steps, which is another reason not to expect
+the extra budget to rescue anything by itself.
