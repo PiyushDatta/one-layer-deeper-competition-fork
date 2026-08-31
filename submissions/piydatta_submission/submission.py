@@ -27,7 +27,10 @@ USE_ACT = False
 # Training depth is bounded by the clock, evaluation depth is nearly free
 # because it is forward-only over a few hundred rows.
 TRAIN_LOOPS = 8
-EVAL_LOOPS = 64
+# The learned ladder settles on stride 2 (T=1->exit 2, T=2->exit 4,
+# T=3->exit 6), so certifying T=64 needs 128 exits, not 64. Evaluation used
+# 5.4s of its 30s budget at 64 loops, so this stays affordable.
+EVAL_LOOPS = 128
 ACT_MAX_LOOPS = 16
 ACT_TAIL_HALT_FRACTION = None
 USE_MUON = True
@@ -41,6 +44,46 @@ LR_DECAY_HOLD_FRACTION = 0.85
 LR_DECAY_MIN_FACTOR = 0.001
 USE_LATENT_HYPOTHESES = True
 HYPOTHESIS_TEMPERATURE = 1.0
+# The soft-min is satisfied when some exit is right, but evaluation reads the
+# argmax-prior exit, so nothing penalises a wrong prior. This weight fits the
+# prior to the detached posterior. Untuned. Set to 0.0 to disable.
+SELECTOR_LOSS_WEIGHT = 1.0
+# Measured: the exit prior collapses to exit 0 for every row at every T, and
+# per-exit accuracy then decays monotonically with depth (0.26 -> 0.03 over
+# eight exits) because only exit 0 ever receives gradient. The posterior is
+# proportional to prior * exp(-loss), so a leading exit reinforces itself and
+# the M step accelerates it. Two counter-measures:
+#
+#   * evidence-only posterior — drop the prior from the M step target so it
+#     fits "which exit explains this row", not "which exit already won";
+#   * mutual information between T and the exit choice — maximise the entropy
+#     of the batch-marginal prior while minimising per-row entropy, so the
+#     selector must be sharp per row yet spread across the batch. Since the
+#     prior is a function of T only, spreading it across the batch is
+#     spreading it across T, which is the exit-k-for-T-k alignment we want.
+#
+# Set EXIT_MI_WEIGHT to 0.0 to ablate.
+EXIT_MI_WEIGHT = 1.0
+POSTERIOR_USES_PRIOR = False
+# Measured after the collapse was broken: the model picks an ANTI-monotone
+# T -> exit map (T=1 -> exit 7, T=2 -> exit 4, T=3 -> exit 1) and returns to
+# 100% train accuracy. A composable squaring needs depth to GROW with T, so an
+# arbitrary permutation is only expressible if the loop index is being used as
+# an index rather than as iterated computation -- B's residual state evolves
+# distinguishably with loop count, so B^k can encode f(x, k), and the prior
+# makes k a proxy for T. Change 7 hid T from attention; depth leaked it back.
+# Forcing the exit centre to be stride * scalar(T) removes the permutation
+# freedom and is also the only form that can extrapolate to T=64.
+EXIT_MONOTONE_IN_T = True
+EXIT_STRIDE_INIT = 1.0
+EXIT_WIDTH_INIT = 1.0
+EXIT_CENTRE_INIT = 2.0
+# A free scalar head just learns to decrease in T. Order has to be built into
+# the digit reader itself. Set False to fall back to the free head.
+EXIT_ORDERED_DIGITS = True
+DIGIT_OFFSET = 7
+NUM_DIGITS = 10
+MAX_T_DIGITS = 3
 NUM_SCRATCHPAD_TOKENS = 4
 # The tied head makes logit scale grow as sqrt(D_MODEL), which peaks the
 # softmax and lets retokenization compound into a feedback loop across loops.
@@ -50,8 +93,34 @@ RETOKENIZE_TEMPERATURE = D_MODEL**0.5 / 8.0
 # sigmoid(-2.0) is about 0.12, so the bottleneck starts nearly closed and the
 # model opens it only if it pays for itself.
 RETOKENIZE_GATE_INIT = -2.0
+# MAIN's tape holds discrete tokens and its modules are not differentiable.
+# Straight-through makes the forward pass commit to one token while the
+# backward pass keeps the soft gradient.
+RETOKENIZE_STRAIGHT_THROUGH = True
+# Gates carry evidence about whether their mechanism pays for itself, but
+# weight decay drifts a -2.0 logit toward 0, that is toward OPENING, whether or
+# not it helps. Exempting them keeps the trajectory readable.
+GATE_PARAMETER_NAMES = ("retokenize_gate", "history_gate")
+GATE_WEIGHT_DECAY = 0.0
+# 512 against E1's 600 training rows with drop_last is one batch per epoch, so
+# full-batch descent. 64 gives 9 batches and real gradient noise. This is one
+# import-time constant with no spec available, so it also applies to Hard,
+# where 512 may well be right. Eval is pinned separately, otherwise the 14
+# depth rungs would run at the training batch size and slow the ladder down.
+TRAIN_BATCH_SIZE = 64
+EVAL_BATCH_SIZE = 512
+# Action history. MAIN drops every task to 0/10 without it, so each loop is fed
+# what changed last iteration and where. Low rank because a full D x D
+# projection is 1.05M parameters at this width.
+USE_ACTION_HISTORY = True
+HISTORY_RANK = 64
+HISTORY_GATE_INIT = -2.0
+# Control/data separation. The recurrent block may not read the T digits, so it
+# cannot pick between x^2, x^4 and x^8 for one x and is pushed toward learning
+# the single squaring step. Only the exit selector sees T.
+HIDE_T_FROM_BLOCK = True
 BUILD_ON_ACCELERATOR = True
-PRINT_LOGS = False
+PRINT_LOGS = True
 DBUG = False
 
 PAD_TOKEN_ID = 0
@@ -60,6 +129,7 @@ X_TOKEN_ID = 3
 T_TOKEN_ID = 4
 ANS_TOKEN_ID = 5
 NUM_SEGMENTS = 5
+T_SEGMENT = 3
 
 
 def training_loss(
@@ -142,6 +212,40 @@ def token_training_loss(batch: TokenLossBatch) -> Tensor:
         dim=1,
     )
     task_loss = row_losses[rows_with_targets].mean()
+
+    if SELECTOR_LOSS_WEIGHT > 0.0:
+        # Explicit M step. The posterior is detached, so this trains the exit
+        # selector to predict which exit actually explains the row without
+        # pulling the block toward any particular depth. Including the prior in
+        # the target makes it self-reinforcing, which is how the collapse to
+        # exit 0 happens, so the evidence-only form is the default.
+        with torch.no_grad():
+            posterior_logits = -sequence_losses / temperature
+            if POSTERIOR_USES_PRIOR:
+                posterior_logits = posterior_logits + hypothesis_log_prior
+            posterior = F.softmax(posterior_logits, dim=1)
+        selector_loss = -(posterior * hypothesis_log_prior).sum(dim=1)
+        task_loss = task_loss + SELECTOR_LOSS_WEIGHT * (
+            selector_loss[rows_with_targets].mean()
+        )
+
+    if EXIT_MI_WEIGHT > 0.0:
+        # Maximise I(T; exit) = H(marginal exit) - E_row[H(exit | row)].
+        # The first term stops every row routing to the same exit, the second
+        # keeps each row's choice decisive. Standard load balancing, but the
+        # information framing is the one that matters here: the prior is a
+        # function of T alone, so a high-entropy marginal is only reachable by
+        # sending different T to different exits.
+        row_log_prior = hypothesis_log_prior
+        if row_log_prior.dim() == 1:
+            row_log_prior = row_log_prior.expand(batch_size, -1)
+        scored_log_prior = row_log_prior[rows_with_targets]
+        scored_prior = scored_log_prior.exp()
+        marginal = scored_prior.mean(dim=0)
+        marginal_entropy = -(marginal * marginal.clamp_min(1e-9).log()).sum()
+        row_entropy = -(scored_prior * scored_log_prior).sum(dim=1).mean()
+        task_loss = task_loss - EXIT_MI_WEIGHT * (marginal_entropy - row_entropy)
+
     return task_loss + PONDER_WEIGHT * ponder_cost
 
 
@@ -446,6 +550,8 @@ class SynchronizedProcessor(nn.Module):
         *,
         num_loops: int | None = None,
         retokenize: Callable[[Tensor], Tensor] | None = None,
+        history: Callable[[Tensor], Tensor] | None = None,
+        prompt_key_mask: Tensor | None = None,
         segment_ids: Tensor | None = None,
         layer_diagnostics: list[dict[str, object]] | None = None,
         stage_states: list[Tensor] | None = None,
@@ -484,12 +590,17 @@ class SynchronizedProcessor(nn.Module):
             dtype=torch.bool,
             device=prompt_memory.device,
         )
+        # The read-only prompt stream can be masked more tightly than the
+        # workspace. The answer is read at target_positions, which sit on the
+        # T segment, so the workspace half must stay fully readable even when
+        # those same positions are withheld from the prompt half.
+        prompt_key = prompt_mask if prompt_key_mask is None else prompt_key_mask.bool()
         work_mask = torch.cat(
             (control_mask, prompt_mask, scratchpad_mask),
             dim=1,
         )
-        if attention_mask is not None:
-            joint_mask = torch.cat((prompt_mask, work_mask), dim=1)
+        if attention_mask is not None or prompt_key_mask is not None:
+            joint_mask = torch.cat((prompt_key, work_mask), dim=1)
 
         joint_segment_ids = None
         joint_stream_ids = None
@@ -542,6 +653,9 @@ class SynchronizedProcessor(nn.Module):
             work_state.retain_grad()
             training_stage_states.append(work_state)
 
+        # Seeding this with the initial work state makes the first delta the
+        # real first update rather than a step from nothing.
+        previous_work_state = work_state
         loops = self.num_loops if num_loops is None else num_loops
         for _ in range(loops):
             joint_state = torch.cat((prompt_memory, work_state), dim=1)
@@ -557,7 +671,7 @@ class SynchronizedProcessor(nn.Module):
                         (torch.zeros_like(prompt_mask), work_mask),
                         dim=1,
                     ),
-                    key_mask=torch.cat((prompt_mask, work_mask), dim=1),
+                    key_mask=torch.cat((prompt_key, work_mask), dim=1),
                     key_stream_ids=joint_stream_ids,
                 )
             work_state = candidate_state[:, prompt_len:]
@@ -582,6 +696,13 @@ class SynchronizedProcessor(nn.Module):
                 training_stage_states.append(work_state)
             if hypothesis_states is not None:
                 hypothesis_states.append(work_state[:, 1:output_end])
+            if history is not None:
+                # Injected after the readout is recorded, so this is
+                # scaffolding for the next loop rather than part of any exit's
+                # answer.
+                readout_state = work_state
+                work_state = work_state + history(work_state - previous_work_state)
+                previous_work_state = readout_state
 
         return work_state
 
@@ -932,17 +1053,58 @@ class Model(nn.Module):
                 D_MODEL,
             )
             nn.init.normal_(self.scratchpad_embedding.weight, std=init_std)
-            # Same reason, these go last. Zero init makes the selector exactly
-            # the old global prior at step 0, so the change cannot regress the
-            # starting point.
+            # Same reason, these go last. With T hidden from the block the
+            # selector is the only path from T to the output, so it starts
+            # random rather than zeroed. Zero init would leave the model
+            # T-blind for the first steps of a budget only ~200 steps long.
             if USE_LATENT_HYPOTHESES:
                 self.exit_norm = RMSNorm(D_MODEL)
                 self.exit_head = nn.Linear(D_MODEL, self.max_loops)
-                nn.init.zeros_(self.exit_head.weight)
+                nn.init.normal_(self.exit_head.weight, std=init_std)
                 nn.init.zeros_(self.exit_head.bias)
+                # Monotone exit parameterisation. A free per-exit head lets the
+                # model pick any T -> exit permutation, and it picks an
+                # anti-monotone one, which is only expressible if depth is an
+                # index rather than iterated computation. Forcing the exit
+                # centre to be stride * scalar(T) makes depth grow with T, so
+                # the only way to serve every T is a genuine per-step operator.
+                self.t_scalar_head = nn.Linear(D_MODEL, 1)
+                nn.init.normal_(self.t_scalar_head.weight, std=init_std)
+                # Bias the centre mid-ladder. At zero bias every row starts at
+                # exit 0, which is where the collapse lives and where the
+                # loop-0 readout predates any recurrence at all.
+                nn.init.constant_(self.t_scalar_head.bias, EXIT_CENTRE_INIT)
+                # A free scalar head is not enough: it simply learns to
+                # DECREASE in T, reproducing the anti-monotone map. Order has
+                # to come from the digit reader. Values are a cumulative sum of
+                # positive increments over the digit tokens, so the map from
+                # digit id to magnitude is increasing by construction, and
+                # place weights are positive. Every value stays learned; only
+                # the ordering is imposed, the way a positional encoding
+                # imposes order without fixing the function.
+                self.digit_increments = nn.Parameter(torch.zeros(NUM_DIGITS))
+                self.place_increments = nn.Parameter(torch.zeros(MAX_T_DIGITS))
+                self.exit_centre = nn.Parameter(torch.tensor(EXIT_CENTRE_INIT))
+                self.exit_stride = nn.Parameter(torch.tensor(EXIT_STRIDE_INIT))
+                self.exit_width = nn.Parameter(torch.tensor(EXIT_WIDTH_INIT))
                 self.retokenize_gate = nn.Parameter(
                     torch.full((), RETOKENIZE_GATE_INIT)
                 )
+            # Seeds the workspace where the T digits are withheld.
+            self.blank_token = nn.Parameter(torch.empty(D_MODEL))
+            nn.init.normal_(self.blank_token, std=init_std)
+            if USE_ACTION_HISTORY:
+                self.history_norm = RMSNorm(D_MODEL)
+                self.history_down = nn.Linear(D_MODEL, HISTORY_RANK, bias=False)
+                self.history_up = nn.Linear(HISTORY_RANK, D_MODEL, bias=False)
+                self.history_where = nn.Parameter(torch.empty(D_MODEL))
+                self.history_gate = nn.Parameter(
+                    torch.full((), HISTORY_GATE_INIT)
+                )
+                nn.init.normal_(self.history_down.weight, std=init_std)
+                # Zero so the signal starts silent and the gate opens it.
+                nn.init.zeros_(self.history_up.weight)
+                nn.init.normal_(self.history_where, std=init_std)
 
         if DBUG:
             self._debug_initial_parameter_buffers = {}
@@ -961,12 +1123,53 @@ class Model(nn.Module):
             return self.max_loops
         return TRAIN_LOOPS if self.training else EVAL_LOOPS
 
+    def _history_signal(self, delta: Tensor) -> Tensor:
+        # What changed, low rank over the previous loop's update.
+        what = self.history_up(self.history_down(self.history_norm(delta)))
+        # Where it changed, MAIN's landmark channel for recently touched cells.
+        change_rms = delta.pow(2).mean(-1, keepdim=True).sqrt()
+        where = change_rms * self.history_where.view(1, 1, -1)
+        return torch.sigmoid(self.history_gate) * (what + where)
+
+    def _ordered_t_value(
+        self,
+        input_ids: Tensor,
+        segment_ids: Tensor,
+        valid_tokens: Tensor,
+    ) -> Tensor:
+        """A learned, order-respecting magnitude for the T digits.
+
+        digit_value is increasing in the digit token id and place weights are
+        positive, so the result is monotone in T without any value being
+        hard-coded.
+        """
+        digit_values = torch.cumsum(F.softplus(self.digit_increments), dim=0)
+        place_weights = torch.cumsum(F.softplus(self.place_increments), dim=0)
+
+        is_digit = input_ids.ge(DIGIT_OFFSET) & valid_tokens
+        t_mask = segment_ids.eq(T_SEGMENT) & is_digit
+        digit_index = (input_ids - DIGIT_OFFSET).clamp(0, NUM_DIGITS - 1)
+        value_at = digit_values[digit_index] * t_mask.to(digit_values.dtype)
+
+        # Rank positions from the right within the T segment so the last digit
+        # is the least significant, then weight by the positive place ladder.
+        flipped = t_mask.flip(-1)
+        rank_from_right = (flipped.cumsum(-1) - 1).clamp(0, MAX_T_DIGITS - 1).flip(-1)
+        weights = place_weights[rank_from_right] * t_mask.to(place_weights.dtype)
+        return (value_at * weights).sum(dim=-1)
+
     def _retokenize(self, workspace: Tensor) -> Tensor:
         normed = self.final_norm(workspace)
         probabilities = F.softmax(
             self.head(normed) / RETOKENIZE_TEMPERATURE,
             dim=-1,
         )
+        if RETOKENIZE_STRAIGHT_THROUGH:
+            hard = F.one_hot(
+                probabilities.argmax(-1),
+                probabilities.shape[-1],
+            ).to(probabilities.dtype)
+            probabilities = hard + probabilities - probabilities.detach()
         # head.weight is token_embedding.weight, so this decodes and re-encodes
         # through the same tied matrix.
         token_view = probabilities @ self.token_embedding.weight
@@ -1018,7 +1221,23 @@ class Model(nn.Module):
             -1,
             -1,
         )
-        workspace_state = prompt_memory + self.workspace_token.view(1, 1, -1)
+        prompt_key_mask = None
+        workspace_seed = prompt_memory
+        if HIDE_T_FROM_BLOCK and segment_ids is not None:
+            t_positions = segment_ids.eq(T_SEGMENT)
+            if attention_mask is not None and attention_mask.shape == segment_ids.shape:
+                valid = attention_mask.bool()
+            else:
+                valid = torch.ones_like(t_positions)
+            prompt_key_mask = valid & ~t_positions
+            # Blank only the seed. These slots stay readable and writable
+            # because the answer is read out on top of them.
+            workspace_seed = torch.where(
+                t_positions[..., None],
+                self.blank_token.view(1, 1, -1) + position_signal,
+                prompt_memory,
+            )
+        workspace_state = workspace_seed + self.workspace_token.view(1, 1, -1)
         scratchpad_state = self.scratchpad_embedding.weight.unsqueeze(0).expand(
             batch_size,
             -1,
@@ -1033,6 +1252,8 @@ class Model(nn.Module):
             "retokenize": (
                 self._retokenize if USE_LATENT_HYPOTHESES else None
             ),
+            "history": self._history_signal if USE_ACTION_HISTORY else None,
+            "prompt_key_mask": prompt_key_mask,
         }
         if (
             layer_diagnostics is None
@@ -1232,10 +1453,14 @@ class Model(nn.Module):
         ]
 
         base_token_state = self.token_embedding(input_ids)
+        # Pass the real segment_ids so these probes vary only the segment
+        # embedding. Dropping them would also lift the T mask and confound the
+        # comparison against the normal forward.
         zero_segment_x, _, _ = self._run_processor(
             base_token_state,
             position_signal,
             attention_mask,
+            segment_ids=segment_ids,
         )
         counterfactual_states = {"zero": zero_segment_x}
         counterfactual_mappings = {
@@ -1257,6 +1482,7 @@ class Model(nn.Module):
                 remapped_state,
                 position_signal,
                 attention_mask,
+                segment_ids=segment_ids,
             )
             counterfactual_states[name] = counterfactual_x
 
@@ -1314,7 +1540,7 @@ class Model(nn.Module):
             token_state,
             position_signal,
             attention_mask,
-            segment_ids=(segment_ids if collect_model_diagnostics else None),
+            segment_ids=segment_ids,
             collect_act_diagnostics=collect_act_diagnostics,
             layer_diagnostics=layer_diagnostics,
             stage_states=stage_states,
@@ -1343,16 +1569,40 @@ class Model(nn.Module):
             # Exit depth has to vary with the prompt's T. Pool the T segment
             # only, where position_signal keeps multi-digit T ordered.
             prompt_features = token_state + position_signal
-            t_weights = (segment_ids.eq(3) & valid_tokens).to(prompt_features.dtype)
+            t_weights = (segment_ids.eq(T_SEGMENT) & valid_tokens).to(
+                prompt_features.dtype
+            )
             t_summary = (prompt_features * t_weights[..., None]).sum(dim=1) / (
                 t_weights.sum(dim=1, keepdim=True).clamp_min(1.0)
             )
-            hypothesis_log_prior = F.log_softmax(
-                (self.exit_head(self.exit_norm(t_summary)) + self.hypothesis_prior)[
-                    :, :active_loops
-                ],
-                dim=-1,
-            )
+            normed_t = self.exit_norm(t_summary)
+            if EXIT_MONOTONE_IN_T:
+                # Exit centre = stride * scalar(T), so depth is forced to grow
+                # with T instead of being a free index the model can permute.
+                # Everything here is learned: the scalar is read from the T
+                # tokens, the stride and width are parameters. Only the
+                # monotone shape is imposed, the way a positional encoding
+                # imposes order without fixing the function.
+                if EXIT_ORDERED_DIGITS:
+                    t_scalar = self._ordered_t_value(input_ids, segment_ids, valid_tokens)
+                else:
+                    t_scalar = self.t_scalar_head(normed_t).squeeze(-1)
+                centre = self.exit_stride.abs() * t_scalar + self.exit_centre
+                positions = torch.arange(
+                    active_loops,
+                    device=t_scalar.device,
+                    dtype=t_scalar.dtype,
+                )
+                width = self.exit_width.abs().clamp_min(1e-2)
+                exit_logits = -(
+                    (positions[None, :] - centre[:, None]) ** 2
+                ) / (2.0 * width * width)
+                exit_logits = exit_logits + self.hypothesis_prior[:active_loops]
+            else:
+                exit_logits = (
+                    self.exit_head(normed_t) + self.hypothesis_prior
+                )[:, :active_loops]
+            hypothesis_log_prior = F.log_softmax(exit_logits, dim=-1)
             selected = hypothesis_log_prior.argmax(dim=-1)
             gather_index = selected[:, None, None, None]
             logits = hypothesis_logits.gather(
@@ -1460,9 +1710,22 @@ def build_model(spec: ModelSpec) -> Model:
         f"LR_DECAY_MIN_FACTOR: {LR_DECAY_MIN_FACTOR}, "
         f"USE_LATENT_HYPOTHESES: {USE_LATENT_HYPOTHESES}, "
         f"HYPOTHESIS_TEMPERATURE: {HYPOTHESIS_TEMPERATURE}, "
+        f"SELECTOR_LOSS_WEIGHT: {SELECTOR_LOSS_WEIGHT}, "
+            f"EXIT_MI_WEIGHT: {EXIT_MI_WEIGHT}, "
+            f"EXIT_MONOTONE_IN_T: {EXIT_MONOTONE_IN_T}, "
+            f"EXIT_ORDERED_DIGITS: {EXIT_ORDERED_DIGITS}, "
+            f"POSTERIOR_USES_PRIOR: {POSTERIOR_USES_PRIOR}, "
+        f"HIDE_T_FROM_BLOCK: {HIDE_T_FROM_BLOCK}, "
+        f"USE_ACTION_HISTORY: {USE_ACTION_HISTORY}, "
+        f"HISTORY_RANK: {HISTORY_RANK}, "
+        f"HISTORY_GATE_INIT: {HISTORY_GATE_INIT}, "
         f"NUM_SCRATCHPAD_TOKENS: {NUM_SCRATCHPAD_TOKENS}, "
         f"RETOKENIZE_TEMPERATURE: {RETOKENIZE_TEMPERATURE}, "
         f"RETOKENIZE_GATE_INIT: {RETOKENIZE_GATE_INIT}, "
+        f"RETOKENIZE_STRAIGHT_THROUGH: {RETOKENIZE_STRAIGHT_THROUGH}, "
+        f"GATE_WEIGHT_DECAY: {GATE_WEIGHT_DECAY}, "
+        f"TRAIN_BATCH_SIZE: {TRAIN_BATCH_SIZE}, "
+        f"EVAL_BATCH_SIZE: {EVAL_BATCH_SIZE}, "
         f"BUILD_ON_ACCELERATOR: {BUILD_ON_ACCELERATOR}, "
         f"PRINT_LOGS: {PRINT_LOGS}, DBUG: {DBUG}",
         flush=True,
@@ -1561,10 +1824,22 @@ def _build_scheduler(optimizer, spec: OptimizerSpec) -> CosineDecayScheduler:
     )
 
 
+def _adamw_groups(named_parameters) -> list[dict]:
+    decayed = []
+    gates = []
+    for name, parameter in named_parameters:
+        bucket = gates if name in GATE_PARAMETER_NAMES else decayed
+        bucket.append(parameter)
+    groups = [{"params": decayed, "weight_decay": 0.1}]
+    if gates:
+        groups.append({"params": gates, "weight_decay": GATE_WEIGHT_DECAY})
+    return groups
+
+
 def build_optimizer(model: nn.Module, spec: OptimizerSpec) -> OptimizerBundle:
     if USE_MUON:
         muon_parameters = []
-        adamw_parameters = []
+        adamw_named = []
         for name, parameter in model.named_parameters():
             use_muon = (
                 parameter.ndim == 2
@@ -1574,7 +1849,7 @@ def build_optimizer(model: nn.Module, spec: OptimizerSpec) -> OptimizerBundle:
             if use_muon:
                 muon_parameters.append(parameter)
             else:
-                adamw_parameters.append(parameter)
+                adamw_named.append((name, parameter))
 
         muon = torch.optim.Muon(
             muon_parameters,
@@ -1584,10 +1859,9 @@ def build_optimizer(model: nn.Module, spec: OptimizerSpec) -> OptimizerBundle:
             adjust_lr_fn=MUON_ADJUST_LR_FN,
         )
         adamw = torch.optim.AdamW(
-            adamw_parameters,
+            _adamw_groups(adamw_named),
             lr=1e-3,
             betas=(0.9, 0.95),
-            weight_decay=0.1,
             capturable=spec.device_type == "cuda",
         )
         optimizer = CombinedOptimizer([muon, adamw])
@@ -1597,10 +1871,9 @@ def build_optimizer(model: nn.Module, spec: OptimizerSpec) -> OptimizerBundle:
         )
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        _adamw_groups(model.named_parameters()),
         lr=1e-3,
         betas=(0.9, 0.95),
-        weight_decay=0.1,
         capturable=spec.device_type == "cuda",
     )
     return OptimizerBundle(optimizer, scheduler=_build_scheduler(optimizer, spec))
@@ -1610,4 +1883,6 @@ SUBMISSION = Submission(
     build_model=build_model,
     build_optimizer=build_optimizer,
     token_training_loss=token_training_loss,
+    batch_size=TRAIN_BATCH_SIZE,
+    eval_batch_size=EVAL_BATCH_SIZE,
 )

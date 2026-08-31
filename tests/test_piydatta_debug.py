@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 from benchmark import (
     count_model_state_elements,
@@ -828,12 +829,181 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
         self.assertGreater(hypothesis_prior.grad.abs().sum(), 0)
         self.assertIsNone(batch.logits.grad)
 
+    def test_gates_are_exempt_from_weight_decay(self) -> None:
+        self.namespace["DBUG"] = False
+        model = self.namespace["build_model"](self.spec)
+        bundle = self.submission.build_optimizer(
+            model,
+            OptimizerSpec(training_time_seconds=60.0, device_type="cpu"),
+        )
+        gate_names = set(self.namespace["GATE_PARAMETER_NAMES"])
+        gates = {
+            id(parameter)
+            for name, parameter in model.named_parameters()
+            if name in gate_names
+        }
+        self.assertGreater(len(gates), 0)
+
+        seen = set()
+        for group in bundle.optimizer.param_groups:
+            decay = group.get("weight_decay")
+            for parameter in group["params"]:
+                if id(parameter) in gates:
+                    seen.add(id(parameter))
+                    self.assertEqual(decay, self.namespace["GATE_WEIGHT_DECAY"])
+                elif decay is not None:
+                    self.assertGreater(decay, 0.0)
+        self.assertEqual(seen, gates)
+
+    def test_straight_through_commits_to_one_token(self) -> None:
+        self.namespace["DBUG"] = False
+        self.assertTrue(self.namespace["RETOKENIZE_STRAIGHT_THROUGH"])
+        model = self.model_class(self.spec, use_act=False)
+        workspace = torch.randn(2, 3, self.namespace["D_MODEL"], requires_grad=True)
+
+        with torch.no_grad():
+            # Open the gate fully so the token view is what comes back.
+            model.retokenize_gate.fill_(20.0)
+        blended = model._retokenize(workspace)
+
+        # Forward is a single embedding row, so it must match one exactly.
+        probabilities = F.softmax(
+            model.head(model.final_norm(workspace))
+            / self.namespace["RETOKENIZE_TEMPERATURE"],
+            dim=-1,
+        )
+        chosen = model.token_embedding.weight[probabilities.argmax(-1)]
+        direction = F.normalize(blended.detach(), dim=-1)
+        torch.testing.assert_close(
+            direction,
+            F.normalize(chosen, dim=-1),
+            atol=1e-4,
+            rtol=1e-4,
+        )
+        # Backward still flows, which is the point of straight-through.
+        blended.sum().backward()
+        self.assertIsNotNone(workspace.grad)
+        self.assertGreater(float(workspace.grad.abs().sum()), 0.0)
+
+    def test_submission_pins_both_batch_sizes(self) -> None:
+        self.assertEqual(
+            self.submission.batch_size, self.namespace["TRAIN_BATCH_SIZE"]
+        )
+        # Unset, eval would inherit the training batch and slow the ladder.
+        self.assertEqual(
+            self.submission.eval_batch_size, self.namespace["EVAL_BATCH_SIZE"]
+        )
+        self.assertGreater(
+            self.submission.eval_batch_size, self.submission.batch_size
+        )
+
+    def test_action_history_is_scaffolding_not_answer(self) -> None:
+        self.namespace["DBUG"] = False
+        self.assertTrue(self.namespace["USE_ACTION_HISTORY"])
+        model = self.model_class(self.spec, use_act=False)
+        model.train()
+
+        recorded = []
+        original = model.processor.forward
+
+        def spy(prompt_memory, work_state, attention_mask=None, **kwargs):
+            hypothesis_states = kwargs.get("hypothesis_states")
+            result = original(prompt_memory, work_state, attention_mask, **kwargs)
+            if hypothesis_states is not None:
+                recorded.extend(state.detach().clone() for state in hypothesis_states)
+            return result
+
+        model.processor.forward = spy
+        _, auxiliary = model(self.input_ids, self.attention_mask)
+
+        # Exit k's readout must be the block output, with no history term added.
+        head, norm = model.head, model.final_norm
+        for exit_index, state in enumerate(recorded):
+            with self.subTest(exit=exit_index):
+                torch.testing.assert_close(
+                    head(norm(state)),
+                    auxiliary["hypothesis_logits"][:, exit_index],
+                )
+
+    def test_action_history_can_be_disabled(self) -> None:
+        self.namespace["DBUG"] = False
+        torch.manual_seed(7)
+        with_history = self.model_class(self.spec, use_act=False)
+        with_history.eval()
+        baseline, _ = with_history(self.input_ids, self.attention_mask)
+
+        # A closed gate is not the same as no signal, so check the hard switch.
+        original = self.namespace["USE_ACTION_HISTORY"]
+        self.namespace["USE_ACTION_HISTORY"] = False
+        try:
+            torch.manual_seed(7)
+            without = self.model_class(self.spec, use_act=False)
+            without.eval()
+            self.assertFalse(hasattr(without, "history_gate"))
+            disabled, _ = without(self.input_ids, self.attention_mask)
+        finally:
+            self.namespace["USE_ACTION_HISTORY"] = original
+
+        self.assertFalse(torch.allclose(baseline, disabled))
+
+    def test_block_cannot_see_the_t_digits(self) -> None:
+        self.namespace["DBUG"] = False
+        self.assertTrue(self.namespace["HIDE_T_FROM_BLOCK"])
+        model = self.model_class(self.spec, use_act=False)
+        model.train()
+
+        # Same N and x, different T digit. Every recurrent state must match.
+        input_ids = torch.tensor([[2, 10, 4, 8], [2, 10, 4, 9]])
+        mask = torch.ones_like(input_ids, dtype=torch.bool)
+        captured = []
+
+        def capture(_module, _args, output):
+            captured.append(output.detach().clone())
+
+        handle = model.processor.block.register_forward_hook(capture)
+        try:
+            _, auxiliary = model(input_ids, mask)
+        finally:
+            handle.remove()
+
+        # prompt_memory still holds the T tokens, they are just unreachable as
+        # attention keys, so the invariant is on what the block produces for
+        # the work stream rather than on its raw input.
+        prompt_len = input_ids.shape[1]
+        self.assertGreater(len(captured), 0)
+        for loop, output in enumerate(captured):
+            with self.subTest(loop=loop):
+                work = output[:, prompt_len:]
+                torch.testing.assert_close(work[0], work[1])
+
+        # Every exit therefore reads the same, T changes nothing downstream.
+        candidates = auxiliary["hypothesis_logits"]
+        torch.testing.assert_close(candidates[0], candidates[1])
+
+        # The exit selector is the one place T is still allowed through.
+        prior = auxiliary["hypothesis_log_prior"]
+        self.assertFalse(torch.allclose(prior[0], prior[1]))
+
+    def test_hiding_t_leaves_the_answer_slots_writable(self) -> None:
+        # target_positions sit on the T segment, so masking the prompt keys
+        # must not also blank the workspace the answer is read from.
+        self.namespace["DBUG"] = False
+        model = self.model_class(self.spec, use_act=False)
+        model.eval()
+        input_ids = torch.tensor([[2, 10, 4, 8]])
+        mask = torch.ones_like(input_ids, dtype=torch.bool)
+
+        logits, _ = model(input_ids, mask)
+
+        self.assertEqual(logits.shape, (1, 4, 17))
+        self.assertTrue(torch.isfinite(logits).all())
+        # Positions 2 and 3 are the T segment and carry the answer.
+        self.assertGreater(float(logits[0, 2].abs().sum()), 0.0)
+        self.assertGreater(float(logits[0, 3].abs().sum()), 0.0)
+
     def test_eval_selects_an_exit_per_row_from_the_t_segment(self) -> None:
         self.namespace["DBUG"] = True
         model = self.model_class(self.spec, use_act=False)
-        with torch.no_grad():
-            torch.nn.init.normal_(model.exit_head.weight, std=1.0)
-            torch.nn.init.normal_(model.exit_head.bias, std=1.0)
         model.eval()
 
         # Two prompts identical except for the digit in the T segment.
@@ -880,9 +1050,55 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
         self.assertGreater(matching, mismatched)
         self.assertLess(hypothesis_prior.grad[1].item(), hypothesis_prior.grad[0].item())
 
+    def test_selector_loss_pulls_the_prior_toward_the_explaining_exit(self) -> None:
+        self.assertGreater(self.namespace["SELECTOR_LOSS_WEIGHT"], 0.0)
+        # Exit 0 predicts token 2, exit 1 predicts token 0, the label is 0.
+        candidate_logits = torch.zeros(1, 2, 1, 3)
+        candidate_logits[0, 0, 0, 2] = 8.0
+        candidate_logits[0, 1, 0, 0] = 8.0
+        hypothesis_prior = torch.zeros(2, requires_grad=True)
+
+        def build():
+            return TokenLossBatch(
+                logits=torch.zeros(1, 1, 3),
+                labels=torch.tensor([[0]]),
+                valid_mask=torch.tensor([[True]]),
+                target_positions=torch.tensor([[0]]),
+                auxiliary={
+                    "ponder_cost": torch.zeros(()),
+                    "hypothesis_logits": candidate_logits,
+                    "hypothesis_log_prior": torch.log_softmax(
+                        hypothesis_prior, dim=0
+                    ),
+                },
+            )
+
+        self.namespace["token_training_loss"](build()).backward()
+        with_selector = hypothesis_prior.grad.clone()
+
+        hypothesis_prior.grad = None
+        original_weight = self.namespace["SELECTOR_LOSS_WEIGHT"]
+        self.namespace["SELECTOR_LOSS_WEIGHT"] = 0.0
+        try:
+            self.namespace["token_training_loss"](build()).backward()
+        finally:
+            self.namespace["SELECTOR_LOSS_WEIGHT"] = original_weight
+        without_selector = hypothesis_prior.grad.clone()
+
+        # Both push the prior toward exit 1, the term makes the push stronger.
+        self.assertLess(with_selector[1].item(), 0.0)
+        self.assertLess(with_selector[1].item(), without_selector[1].item())
+
     def test_row_loss_is_a_soft_min_bounded_by_the_exit_losses(self) -> None:
         # Equal exits must reduce to plain cross entropy, and unequal exits
-        # must land between the best exit and their mean.
+        # must land between the best exit and their mean. Isolate the soft-min
+        # from the selector term, which adds the prior/posterior cross entropy.
+        original_weight = self.namespace["SELECTOR_LOSS_WEIGHT"]
+        self.namespace["SELECTOR_LOSS_WEIGHT"] = 0.0
+        self.addCleanup(
+            self.namespace.__setitem__, "SELECTOR_LOSS_WEIGHT", original_weight
+        )
+
         def row_loss(second_exit_logit: float) -> float:
             candidate_logits = torch.zeros(1, 2, 1, 3)
             candidate_logits[0, 0, 0, 0] = 4.0
