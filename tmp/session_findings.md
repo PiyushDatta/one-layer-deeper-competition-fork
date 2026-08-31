@@ -269,3 +269,41 @@ Hard attempt.
 
 M1 also scored 0.00033 with 4,561 steps, which is another reason not to expect
 the extra budget to rescue anything by itself.
+
+## 15. The probe's advantage was data, not architecture
+
+Section 9 found a probe reaching 0.812 held-out on `x*y mod 323` with dedicated
+answer slots, and section 10 ported those slots for a real +10.7%. The obvious
+next step was to port the rest of the probe: four distinct layers instead of one
+tied block. Two experiments kill that.
+
+**Layer banks make it worse.** Cycling a bank of distinct blocks across loops,
+scored on test 3-digit exact accuracy, which no configuration has ever moved off
+zero:
+
+| config | params | steps | test CE | test 3-digit |
+|---|---:|---:|---:|---:|
+| tied block (current) | 12,907,795 | 443 | 4.251 | 0.000 |
+| 2 blocks | 25,501,971 | 441 | 4.935 | 0.000 |
+| 4 blocks | 50,690,323 | 404 | 5.274 | 0.000 |
+| 4 blocks, d256 | 3,235,603 | 393 | 4.675 | 0.000 |
+| **tied block, d256** | **867,859** | 433 | **3.514** | 0.000 |
+
+More distinct layers monotonically worsens CE. The single tied block at width
+256 is the best of the set.
+
+**And the probe architecture fails at our data volume.** Same `w256 h4 L4` with
+answer slots, trained on 248 pairs instead of 74,649:
+
+```
+budget  steps  train  held
+   60s   4853  1.000  0.000
+```
+
+0.812 with 74,649 pairs, 0.000 with 248. The architecture was never the
+constraint. Sample complexity is: this design needs roughly two orders of
+magnitude more examples than the task provides, and E1 provides 248 because
+there are only 288 units.
+
+The layer-bank knob was reverted rather than shipped, since it measured negative
+and would add hot-path risk before a deadline.
