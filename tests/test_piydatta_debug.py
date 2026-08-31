@@ -503,10 +503,24 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
             processor.work_state[:, :1],
             expected_control,
         )
-        torch.testing.assert_close(
-            processor.work_state[:, 1 : 1 + self.input_ids.shape[1]],
-            expected_workspace,
+        # The last MAX_ANSWER_DIGITS valid slots are seeded from dedicated
+        # answer queries, not from prompt content, so only the slots before
+        # them should match the aligned prompt.
+        length = int(self.attention_mask.sum())
+        keep = length - self.namespace["MAX_ANSWER_DIGITS"]
+        workspace = processor.work_state[:, 1 : 1 + self.input_ids.shape[1]]
+        if keep > 0:
+            torch.testing.assert_close(
+                workspace[:, :keep], expected_workspace[:, :keep]
+            )
+        queries = (
+            model.answer_query.weight
+            + model.position_embedding(
+                torch.arange(keep, length).clamp_min(0)
+            )
+            + model.workspace_token.view(1, -1)
         )
+        torch.testing.assert_close(workspace[0, keep:length], queries)
         expected_scratchpad = model.scratchpad_embedding.weight.unsqueeze(0)
         torch.testing.assert_close(
             processor.work_state[:, 1 + self.input_ids.shape[1] :],

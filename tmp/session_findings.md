@@ -172,3 +172,59 @@ model, so the structural work was not wasted even though it did not reach Max T.
 SAM is a wash on score, 0.0513 against 0.0516, despite cutting test loss from
 5.78 to 4.02 in the single-dataset measurement. It buys loss geometry and costs
 half the step count. Keep or drop on other grounds; it does not move the metric.
+
+## 9. Correction: it is NOT architecture-limited
+
+Section 7 concluded that a transformer over digit tokens cannot do modular
+arithmetic, from a probe reaching 0.085 held-out on `x*y mod 323`. **That probe
+was badly designed.** It read the answer off the last three *input* digit
+positions. Giving the model three dedicated learned query slots instead, same
+data, same tokenisation:
+
+| config | params | steps | train | held |
+|---|---:|---:|---:|---:|
+| w256 h4 L2 | 1,588,748 | 13,390 | 0.930 | **0.722** |
+| w256 h4 L4 | 3,168,268 | 6,760 | 0.953 | **0.812** |
+| w256 h4 L8 | 6,327,308 | 3,076 | 0.934 | 0.765 |
+| w512 h8 L4 | 12,627,980 | 2,255 | 0.888 | 0.295 |
+
+0.812 against 0.085. Digit-tokenised modular arithmetic is learnable. The
+readout was the bottleneck. Section 7's coverage result still stands, 279 of
+288 units shown still generalises to none, but its architecture claim does not.
+
+## 10. Answer queries, the first real cross-dataset gain
+
+Ported into the submission: the last `MAX_ANSWER_DIGITS` valid workspace slots
+are seeded from dedicated learned queries rather than prompt content. The
+prompt stream stays readable so nothing is lost.
+
+| dataset | queries | no queries |
+|---|---:|---:|
+| e1 | 0.0433 | 0.0517 |
+| e2 | 0.0156 | 0.0042 |
+| e3 | 0.0094 | 0.0106 |
+| e4 | 0.0085 | 0.0076 |
+| e5 | 0.0071 | 0.0033 |
+| e6 | 0.0786 | 0.0786 |
+| e7 | 0.0715 | 0.0597 |
+| e8 | 0.1068 | 0.1009 |
+| e9 | 0.0311 | 0.0378 |
+| e10 | 0.1461 | 0.1141 |
+| **mean** | **0.0518** | **0.0468** |
+
+Ahead on 6, behind on 3, tied on 1. On E1 it also cuts test loss 3.82 to 3.46
+and ood 4.17 to 3.48, and reaches train exact 0.313 at step 300 against 0.234.
+
+## 11. The 12 correct predictions are real, not a constant
+
+Dumping E1 predictions: test emits **59 distinct answers** across 150 rows with
+the modal one appearing 7 times, ood emits 31 distinct across 100. The model is
+input-dependent. The recurring 5/150 and 7/100 across configurations is
+small-number coincidence near chance, not collapse onto the marginal.
+
+## 12. Medium is harder, not easier
+
+M1, fixed N=10403, 600s: **train exact 0.000 at 1,900 steps**, loss plateaued at
+4.37. The extra compute and 45x the data do not help because five-digit N is a
+much harder step map. The grokking-regime argument for Medium does not survive
+contact with M1.
