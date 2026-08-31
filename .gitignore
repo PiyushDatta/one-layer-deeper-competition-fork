@@ -7,3 +7,6 @@ logs
 data/generated
 .codex
 user_subs
+tmp/__pycache__/
+tmp/*.pdf
+tmp/variants/

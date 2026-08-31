@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from benchmark import (
+    BackwardPassContext,
     count_model_state_elements,
     ModelSpec,
     OptimizerSpec,
@@ -828,6 +829,68 @@ class PiydattaDebugBoundaryTests(unittest.TestCase):
         self.assertEqual(candidate_logits.grad[:, :, 2].abs().sum(), 0)
         self.assertGreater(hypothesis_prior.grad.abs().sum(), 0)
         self.assertIsNone(batch.logits.grad)
+
+    def test_sam_perturbs_then_restores_before_updating(self) -> None:
+        self.namespace["DBUG"] = False
+        self.assertGreater(self.namespace["SAM_RHO"], 0.0)
+        # Not build_model, which materialises on the accelerator while the
+        # fixture inputs are on the CPU.
+        model = self.model_class(self.spec, use_act=False)
+        bundle = self.submission.build_optimizer(
+            model,
+            OptimizerSpec(training_time_seconds=60.0, device_type="cpu"),
+        )
+        self.assertEqual(bundle.backward_passes_per_step, 2)
+        self.assertIsNotNone(bundle.between_backward_passes)
+
+        logits, _ = model(self.input_ids, self.attention_mask)
+        logits[self.attention_mask].square().mean().backward()
+        before = {
+            name: parameter.detach().clone()
+            for name, parameter in model.named_parameters()
+        }
+
+        with torch.no_grad():
+            bundle.between_backward_passes(
+                BackwardPassContext(completed_steps=0, pass_index=1, total_passes=2)
+            )
+        moved = [
+            name
+            for name, parameter in model.named_parameters()
+            if not torch.equal(parameter, before[name])
+        ]
+        self.assertGreater(len(moved), 0)
+
+        # The perturbation must be exactly rho in global norm.
+        squared = sum(
+            float((parameter - before[name]).pow(2).sum())
+            for name, parameter in model.named_parameters()
+        )
+        self.assertAlmostEqual(squared**0.5, self.namespace["SAM_RHO"], places=4)
+
+        # Freezing the learning rate isolates restoration from the update.
+        for group in bundle.optimizer.param_groups:
+            group["lr"] = 0.0
+        bundle.optimizer.step()
+        for name, parameter in model.named_parameters():
+            with self.subTest(parameter=name):
+                torch.testing.assert_close(parameter, before[name])
+
+    def test_sam_can_be_ablated_to_a_single_pass(self) -> None:
+        self.namespace["DBUG"] = False
+        original = self.namespace["SAM_RHO"]
+        self.namespace["SAM_RHO"] = 0.0
+        try:
+            model = self.namespace["build_model"](self.spec)
+            bundle = self.submission.build_optimizer(
+                model,
+                OptimizerSpec(training_time_seconds=60.0, device_type="cpu"),
+            )
+        finally:
+            self.namespace["SAM_RHO"] = original
+        self.assertEqual(bundle.backward_passes_per_step, 1)
+        self.assertIsNone(bundle.between_backward_passes)
+        self.assertIsNone(bundle.optimizer.restore)
 
     def test_gates_are_exempt_from_weight_decay(self) -> None:
         self.namespace["DBUG"] = False

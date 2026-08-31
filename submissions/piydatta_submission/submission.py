@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from benchmark import (
     assert_model_state,
+    BackwardPassContext,
     ModelSpec,
     OptimizerBundle,
     OptimizerSpec,
@@ -102,6 +103,10 @@ RETOKENIZE_STRAIGHT_THROUGH = True
 # not it helps. Exempting them keeps the trajectory readable.
 GATE_PARAMETER_NAMES = ("retokenize_gate", "history_gate")
 GATE_WEIGHT_DECAY = 0.0
+# Embeddings and the tied head live in AdamW, which is where memorising the
+# answer distribution happens, so this needs to be tunable separately from
+# the block's Muon decay.
+ADAMW_WEIGHT_DECAY = 0.1
 # 512 against E1's 600 training rows with drop_last is one batch per epoch, so
 # full-batch descent. 64 gives 9 batches and real gradient noise. This is one
 # import-time constant with no spec available, so it also applies to Hard,
@@ -109,6 +114,12 @@ GATE_WEIGHT_DECAY = 0.0
 # depth rungs would run at the training batch size and slow the ladder down.
 TRAIN_BATCH_SIZE = 64
 EVAL_BATCH_SIZE = 512
+# Sharpness-aware minimisation. Measure the gradient at w + rho * g/||g||, the
+# locally worst nearby point, and apply it at w. Biases toward wide basins,
+# which is where the compositional solution should live and where memorising
+# 600 points individually does not. Costs a second evaluator-owned pass, so it
+# halves the step count. 0.0 ablates back to one pass.
+SAM_RHO = 0.05
 # Action history. MAIN drops every task to 0/10 without it, so each loop is fed
 # what changed last iteration and where. Low rank because a full D x D
 # projection is 1.05M parameters at this width.
@@ -1724,8 +1735,10 @@ def build_model(spec: ModelSpec) -> Model:
         f"RETOKENIZE_GATE_INIT: {RETOKENIZE_GATE_INIT}, "
         f"RETOKENIZE_STRAIGHT_THROUGH: {RETOKENIZE_STRAIGHT_THROUGH}, "
         f"GATE_WEIGHT_DECAY: {GATE_WEIGHT_DECAY}, "
+        f"ADAMW_WEIGHT_DECAY: {ADAMW_WEIGHT_DECAY}, "
         f"TRAIN_BATCH_SIZE: {TRAIN_BATCH_SIZE}, "
         f"EVAL_BATCH_SIZE: {EVAL_BATCH_SIZE}, "
+        f"SAM_RHO: {SAM_RHO}, "
         f"BUILD_ON_ACCELERATOR: {BUILD_ON_ACCELERATOR}, "
         f"PRINT_LOGS: {PRINT_LOGS}, DBUG: {DBUG}",
         flush=True,
@@ -1734,8 +1747,13 @@ def build_model(spec: ModelSpec) -> Model:
 
 
 class CombinedOptimizer:
-    def __init__(self, optimizers: list[torch.optim.Optimizer]) -> None:
+    def __init__(
+        self,
+        optimizers: list[torch.optim.Optimizer],
+        restore: tuple[list[Tensor], list[Tensor | None]] | None = None,
+    ) -> None:
         self.optimizers = optimizers
+        self.restore = restore
 
     @property
     def param_groups(self) -> list[dict]:
@@ -1748,6 +1766,15 @@ class CombinedOptimizer:
             optimizer.zero_grad(set_to_none=set_to_none)
 
     def step(self, closure=None):
+        if self.restore is not None:
+            # Undo the SAM perturbation first, so the gradient measured at the
+            # worsened point is applied at the original one.
+            parameters, perturbation = self.restore
+            with torch.no_grad():
+                for parameter, epsilon in zip(parameters, perturbation):
+                    if epsilon is not None:
+                        parameter.sub_(epsilon)
+            perturbation[:] = [None] * len(perturbation)
         result = None
         for optimizer in self.optimizers:
             value = (
@@ -1830,10 +1857,52 @@ def _adamw_groups(named_parameters) -> list[dict]:
     for name, parameter in named_parameters:
         bucket = gates if name in GATE_PARAMETER_NAMES else decayed
         bucket.append(parameter)
-    groups = [{"params": decayed, "weight_decay": 0.1}]
+    groups = [{"params": decayed, "weight_decay": ADAMW_WEIGHT_DECAY}]
     if gates:
         groups.append({"params": gates, "weight_decay": GATE_WEIGHT_DECAY})
     return groups
+
+
+def _sam_bundle(
+    optimizers: list[torch.optim.Optimizer],
+    model: nn.Module,
+    spec: OptimizerSpec,
+) -> OptimizerBundle:
+    """Wrap the optimizers, adding the SAM perturb/restore pair when enabled."""
+
+    if SAM_RHO <= 0.0:
+        optimizer = CombinedOptimizer(optimizers)
+        return OptimizerBundle(optimizer, scheduler=_build_scheduler(optimizer, spec))
+
+    parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    perturbation: list[Tensor | None] = [None] * len(parameters)
+
+    def perturb(context: BackwardPassContext) -> None:
+        # The evaluator only calls this before the final pass, and already
+        # under no_grad. Gradients here are post-clip, so rho is measured
+        # against a clipped norm.
+        total_square = torch.zeros((), device=parameters[0].device)
+        for parameter in parameters:
+            if parameter.grad is not None:
+                total_square = total_square + parameter.grad.pow(2).sum()
+        scale = SAM_RHO / total_square.sqrt().clamp_min(1e-12)
+        for index, parameter in enumerate(parameters):
+            if parameter.grad is None:
+                perturbation[index] = None
+                continue
+            step = parameter.grad * scale
+            perturbation[index] = step
+            parameter.add_(step)
+
+    optimizer = CombinedOptimizer(optimizers, restore=(parameters, perturbation))
+    return OptimizerBundle(
+        optimizer,
+        scheduler=_build_scheduler(optimizer, spec),
+        backward_passes_per_step=2,
+        between_backward_passes=perturb,
+    )
 
 
 def build_optimizer(model: nn.Module, spec: OptimizerSpec) -> OptimizerBundle:
@@ -1864,19 +1933,15 @@ def build_optimizer(model: nn.Module, spec: OptimizerSpec) -> OptimizerBundle:
             betas=(0.9, 0.95),
             capturable=spec.device_type == "cuda",
         )
-        optimizer = CombinedOptimizer([muon, adamw])
-        return OptimizerBundle(
-            optimizer,
-            scheduler=_build_scheduler(optimizer, spec),
-        )
+        return _sam_bundle([muon, adamw], model, spec)
 
-    optimizer = torch.optim.AdamW(
+    adamw = torch.optim.AdamW(
         _adamw_groups(model.named_parameters()),
         lr=1e-3,
         betas=(0.9, 0.95),
         capturable=spec.device_type == "cuda",
     )
-    return OptimizerBundle(optimizer, scheduler=_build_scheduler(optimizer, spec))
+    return _sam_bundle([adamw], model, spec)
 
 
 SUBMISSION = Submission(
