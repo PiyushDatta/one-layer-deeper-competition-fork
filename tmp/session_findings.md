@@ -307,3 +307,26 @@ there are only 288 units.
 
 The layer-bank knob was reverted rather than shipped, since it measured negative
 and would add hot-path risk before a deadline.
+
+## 16. Width A/B: a wash on score, clearly better calibrated at 256
+
+`D_MODEL=1024` was never validated across datasets. It was chosen while arguing
+width-for-depth, an argument that did not survive. Ten Easy datasets:
+
+| | mean exact | mean loss |
+|---|---:|---:|
+| d1024 (shipped) | **0.0512** | 3.047 |
+| d512 | 0.0502 | 2.849 |
+| d256 | 0.0497 | **2.550** |
+
+Exact accuracy is a three-way tie inside noise, differences of one or two
+examples per dataset. Cross entropy is not: 256 is better on 8 of 10 datasets
+and 0.50 nats better on the mean, at **one fifteenth the parameters**.
+
+Not changed. The ranked metric is exact accuracy, and the Hard tiebreak is
+accuracy at the first uncertified rung, so neither rewards calibration. Paying
+0.0015 exact for a CE gain that does not feed the ranking is not a trade worth
+making on this evidence.
+
+Recorded because it inverts the assumption the width was originally chosen on:
+15x the parameters buys nothing measurable here, and costs calibration.
